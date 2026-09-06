@@ -28,6 +28,45 @@ const MAX_AI_FOLLOWUPS = 8;
 
 /*
   ==========================================================
+  WHY THIS FILE WAS REWRITTEN
+  ==========================================================
+
+  The previous version tried to figure out "has this already
+  been asked / already been answered?" by:
+
+    1. Comparing the NEW question's wording against OLD
+       questions' wording (word-overlap similarity), and
+    2. Guessing which clinical "topic" a question belonged to
+       by scanning it for keyword phrases.
+
+  Both of those are guesses. A small/fast model like Flash will
+  happily re-ask the same clinical thing in different words, and
+  a keyword scan won't always recognize the new phrasing either
+  — so the guess-based repeat detector silently failed and the
+  interview looped.
+
+  This version removes the guessing entirely. There is a fixed,
+  known list of clinical topics (CLINICAL_TOPICS below). The app
+  — not the model — always knows exactly which topic was just
+  asked about (topicInFlightRef) and exactly which topics are
+  still open (remaining topics = the list minus whatever is
+  already recorded in topicAnswersRef). Gemini is only asked to:
+
+    - extract the answer for the topic we just asked about, and
+    - pick the NEXT question from the REMAINING list we hand it.
+
+  If Gemini ever tries to pick a topic that isn't in that
+  remaining list (already covered, hallucinated, whatever), the
+  app overrides it and deterministically asks about the next
+  open topic itself, using a built-in fallback question. If the
+  Gemini call fails outright (bad key, network, rate limit), the
+  same deterministic fallback keeps the interview moving instead
+  of getting stuck. A topic can only ever be asked about once,
+  by construction — not by detection.
+*/
+
+/*
+  ==========================================================
   DEMO PATIENT RECORD
   ==========================================================
 
@@ -57,9 +96,7 @@ const DEMO_PATIENT_RECORD = {
 
   allergies: ["No known drug allergies"],
 
-  familyHistory: [
-    "Father — hypertension",
-  ],
+  familyHistory: ["Father — hypertension"],
 
   lifestyle: [
     "Non-smoker",
@@ -231,185 +268,108 @@ const RED_FLAG_PATTERNS = [
 ];
 
 /*
-  These are NOT a question flow.
+  ==========================================================
+  CLINICAL TOPICS — the fixed checklist
+  ==========================================================
 
-  They are only used as memory labels so the AI can understand
-  which kinds of information have already been established.
+  This is the single source of truth for "what still needs to
+  be asked". chiefComplaint is not in this list because
+  question 1 always establishes it directly from the patient's
+  own opening answer.
+
+  Order here is just the order used when the app has to pick a
+  fallback topic itself (Gemini is still free to choose any
+  remaining topic in whatever order makes clinical sense).
 */
-const MEMORY_TOPIC_KEYWORDS = {
-  chiefComplaint: [
-    "what brings you",
-    "what problem",
-    "what is the problem",
-    "what symptom",
-    "why are you here",
-    "reason for your visit",
-    "main complaint",
-    "main problem",
-    "आप किस समस्या",
-    "क्या परेशानी है",
-    "मुख्य समस्या",
-    "మీరు ఏ సమస్యతో",
-    "మీ ప్రధాన సమస్య",
-    "ఇబ్బంది ఏమిటి",
-    "என்ன பிரச்சினை",
-    "முதன்மை பிரச்சினை",
-  ],
+const CLINICAL_TOPICS = [
+  "onset",
+  "location",
+  "character",
+  "severity",
+  "timing",
+  "radiation",
+  "aggravatingFactors",
+  "relievingFactors",
+  "associatedSymptoms",
+  "relevantHistory",
+];
 
-  onset: [
-    "how long",
-    "since when",
-    "days",
-    "weeks",
-    "months",
-    "years",
-    "ఎన్ని రోజుల",
-    "ఎప్పటి నుంచి",
-    "ఎన్ని రోజులు",
-    "कितने दिन",
-    "कब से",
-    "எத்தனை நாட்கள்",
-    "எப்போது முதல்",
-  ],
+/*
+  Deterministic backup questions.
 
-  location: [
-    "where",
-    "location",
-    "which part",
-    "where exactly",
-    "ఎక్కడ",
-    "ఏ ప్రాంతంలో",
-    "कहां",
-    "किस जगह",
-    "எங்கே",
-    "எந்த இடத்தில்",
-  ],
+  These are only ever used when Gemini's response is missing,
+  malformed, or tries to re-cover an already-answered topic, or
+  when the API call fails outright. They guarantee the interview
+  can always take one more real step forward without needing the
+  model at all.
+*/
+const TOPIC_FALLBACK_QUESTIONS = {
+  English: {
+    onset: "How long ago did this start, and when did you first notice it?",
+    location: "Where exactly do you feel it — which part of the body?",
+    character:
+      "How would you describe it — sharp, dull, burning, throbbing, or something else?",
+    severity: "On a 0 to 10 scale, how severe is it right now?",
+    timing:
+      "Is it constant, or does it come and go, and is it getting better or worse?",
+    radiation: "Does it spread or move to any other part of your body?",
+    aggravatingFactors: "Is there anything that makes it worse?",
+    relievingFactors: "Is there anything that makes it feel better?",
+    associatedSymptoms:
+      "Are you noticing any other symptoms along with this, such as fever, nausea, or dizziness?",
+    relevantHistory:
+      "Has anything like this happened before, or does it relate to any illness you already have?",
+  },
 
-  severity: [
-    "how severe",
-    "how bad",
-    "intensity",
-    "scale of",
-    "rate the pain",
-    "1 to 10",
-    "తీవ్రత",
-    "ఎంత తీవ్రంగా",
-    "कितना तेज",
-    "तीव्रता",
-    "எவ்வளவு கடுமை",
-  ],
+  Hindi: {
+    onset: "यह कब शुरू हुआ, और आपने इसे पहली बार कब महसूस किया?",
+    location: "यह शरीर के किस हिस्से में महसूस होता है?",
+    character:
+      "इसे आप कैसे बताएंगे — तेज़ दर्द, हल्का दर्द, जलन, या धड़कने जैसा?",
+    severity: "0 से 10 के पैमाने पर, अभी यह कितना गंभीर है?",
+    timing: "क्या यह लगातार रहता है या आता-जाता है, और यह बेहतर हो रहा है या बढ़ रहा है?",
+    radiation: "क्या यह शरीर के किसी और हिस्से में फैलता है?",
+    aggravatingFactors: "क्या कुछ ऐसा है जिससे यह बढ़ जाता है?",
+    relievingFactors: "क्या कुछ ऐसा है जिससे यह कम होता है?",
+    associatedSymptoms:
+      "क्या इसके साथ कोई और लक्षण हैं, जैसे बुखार, जी मिचलाना या चक्कर?",
+    relevantHistory:
+      "क्या पहले भी ऐसा हुआ है, या यह आपकी किसी मौजूदा बीमारी से जुड़ा है?",
+  },
 
-  radiation: [
-    "spread",
-    "spreading",
-    "move anywhere",
-    "travel anywhere",
-    "radiate",
-    "go anywhere else",
-    "వేరే ప్రాంతానికి",
-    "మరో ప్రాంతానికి",
-    "फैल",
-    "दूसरी जगह",
-    "வேறு இடத்திற்கு",
-  ],
+  Telugu: {
+    onset: "ఇది ఎప్పుడు మొదలైంది, మీరు దీన్ని మొదట ఎప్పుడు గమనించారు?",
+    location: "ఇది శరీరంలో ఎక్కడ, ఏ భాగంలో అనిపిస్తుంది?",
+    character:
+      "దీన్ని మీరు ఎలా చెబుతారు — పదునుగా, మందంగా, మంటలాగా, లేదా కొట్టుకున్నట్లు?",
+    severity: "0 నుండి 10 స్కేల్‌లో, ఇది ఇప్పుడు ఎంత తీవ్రంగా ఉంది?",
+    timing:
+      "ఇది నిరంతరం ఉంటుందా లేక వస్తూ పోతూ ఉంటుందా, మరియు ఇది తగ్గుతోందా పెరుగుతోందా?",
+    radiation: "ఇది శరీరంలోని మరో భాగానికి వ్యాపిస్తుందా?",
+    aggravatingFactors: "దీన్ని ఎక్కువ చేసే విషయం ఏదైనా ఉందా?",
+    relievingFactors: "దీన్ని తగ్గించే విషయం ఏదైనా ఉందా?",
+    associatedSymptoms:
+      "దీనితో పాటు జ్వరం, వికారం లేదా తలతిరగడం వంటి ఇతర లక్షణాలు ఏమైనా ఉన్నాయా?",
+    relevantHistory:
+      "గతంలో ఇలా జరిగిందా, లేదా ఇది మీ ప్రస్తుత ఆరోగ్య పరిస్థితికి సంబంధించినదా?",
+  },
 
-  character: [
-    "what does it feel like",
-    "type of pain",
-    "burning",
-    "sharp",
-    "dull",
-    "cramping",
-    "stabbing",
-    "బరువుగా",
-    "మంట",
-    "మొద్దుగా",
-    "చురుకుగా",
-    "जलन",
-    "जलता",
-    "कसाव",
-    "எரிச்சல்",
-  ],
-
-  timing: [
-    "constant",
-    "comes and goes",
-    "when does it happen",
-    "time of day",
-    "episodes",
-    "ఎప్పుడు వస్తుంది",
-    "తరచుగా",
-    "कब होता है",
-    "बार बार",
-    "எப்போது வருகிறது",
-  ],
-
-  aggravatingFactors: [
-    "worse when",
-    "worsen",
-    "makes it worse",
-    "trigger",
-    "after eating",
-    "walking",
-    "movement",
-    "తింటే",
-    "నడిచినప్పుడు",
-    "కదిలినప్పుడు",
-    "खाने के बाद",
-    "चलने पर",
-    "हिलने पर",
-  ],
-
-  relievingFactors: [
-    "better when",
-    "relieve",
-    "relief",
-    "what helps",
-    "rest",
-    "medicine",
-    "తగ్గుతుంది",
-    "ఉపశమనం",
-    "आराम",
-    "दवा",
-    "எது குறைக்கிறது",
-  ],
-
-  associatedSymptoms: [
-    "any other symptoms",
-    "other symptoms",
-    "along with",
-    "associated",
-    "vomiting",
-    "nausea",
-    "fever",
-    "dizziness",
-    "diarrhea",
-    "వాంతి",
-    "వికారం",
-    "జ్వరం",
-    "తల తిరగడం",
-    "वांटिंग",
-    "उल्टी",
-    "बुखार",
-    "चक्कर",
-    "வாந்தி",
-    "காய்ச்சல்",
-  ],
-
-  relevantHistory: [
-    "happened before",
-    "previously",
-    "past history",
-    "medical history",
-    "similar episode",
-    "पहले हुआ",
-    "पुरानी बीमारी",
-    "ముందు కూడా",
-    "గతంలో",
-    "మునుపు",
-    "முன்பு",
-    "மருத்துவ வரலாறு",
-  ],
+  Tamil: {
+    onset: "இது எப்போது தொடங்கியது, முதலில் எப்போது கவனித்தீர்கள்?",
+    location: "இது உடலின் எந்த பகுதியில் உணரப்படுகிறது?",
+    character:
+      "இதை எப்படி சொல்வீர்கள் — கூர்மையாக, மந்தமாக, எரிச்சலாக, அல்லது துடிப்பதுபோல?",
+    severity: "0 முதல் 10 அளவில், இது இப்போது எவ்வளவு கடுமையானது?",
+    timing:
+      "இது தொடர்ந்து இருக்குமா அல்லது வந்து போகுமா, மேலும் இது மேம்படுகிறதா மோசமாகிறதா?",
+    radiation: "இது உடலின் வேறு பகுதிக்கு பரவுகிறதா?",
+    aggravatingFactors: "இதை மோசமாக்கும் எதுவும் உள்ளதா?",
+    relievingFactors: "இதை குறைக்கும் எதுவும் உள்ளதா?",
+    associatedSymptoms:
+      "இதனுடன் காய்ச்சல், குமட்டல் அல்லது தலைச்சுற்றல் போன்ற வேறு அறிகுறிகள் ஏதேனும் உள்ளதா?",
+    relevantHistory:
+      "இதற்கு முன் இது போல் ஏற்பட்டதுண்டா, அல்லது இது உங்கள் தற்போதைய உடல்நல நிலைமையுடன் தொடர்புடையதா?",
+  },
 };
 
 function normalizeText(text) {
@@ -438,7 +398,6 @@ function detectSymptomType(text) {
     normalized.includes("सीने") ||
     normalized.includes("छाती") ||
     normalized.includes("ఛాతీ") ||
-    normalized.includes("నెంచు") ||
     normalized.includes("நெஞ்சு")
   ) {
     return "chest";
@@ -508,9 +467,7 @@ function cleanGeminiJson(text) {
 
     if (firstBrace !== -1 && lastBrace !== -1) {
       try {
-        return JSON.parse(
-          cleaned.slice(firstBrace, lastBrace + 1)
-        );
+        return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
       } catch {
         return null;
       }
@@ -527,30 +484,14 @@ function getPatientContext(patientData) {
 
   return {
     consultationType:
-      patientData.consultationType ||
-      "General consultation",
+      patientData.consultationType || "General consultation",
 
     patientName:
-      patientData.name ||
-      patientData.patientName ||
-      DEMO_PATIENT_RECORD.name,
+      patientData.name || patientData.patientName || DEMO_PATIENT_RECORD.name,
 
-    age:
-      patientData.age ||
-      DEMO_PATIENT_RECORD.age,
+    age: patientData.age || DEMO_PATIENT_RECORD.age,
 
-    gender:
-      patientData.gender ||
-      DEMO_PATIENT_RECORD.gender,
-
-    knownSymptoms:
-      patientData.symptoms || [],
-
-    existingClinicalContext:
-      patientData.clinicalContext || {},
-
-    interviewMemory:
-      patientData.interviewMemory || {},
+    gender: patientData.gender || DEMO_PATIENT_RECORD.gender,
 
     previousMedicalHistory:
       patientData.previousMedicalHistory ||
@@ -560,632 +501,156 @@ function getPatientContext(patientData) {
       patientData.currentMedications ||
       DEMO_PATIENT_RECORD.currentMedications,
 
-    allergies:
-      patientData.allergies ||
-      DEMO_PATIENT_RECORD.allergies,
+    allergies: patientData.allergies || DEMO_PATIENT_RECORD.allergies,
 
     familyHistory:
-      patientData.familyHistory ||
-      DEMO_PATIENT_RECORD.familyHistory,
+      patientData.familyHistory || DEMO_PATIENT_RECORD.familyHistory,
 
-    lifestyle:
-      patientData.lifestyle ||
-      DEMO_PATIENT_RECORD.lifestyle,
+    lifestyle: patientData.lifestyle || DEMO_PATIENT_RECORD.lifestyle,
   };
 }
 
 function buildTranscript(conversation) {
   return conversation
     .map((message) => {
-      const speaker =
-        message.role === "patient"
-          ? "PATIENT"
-          : "MEDIKIOSK";
-
+      const speaker = message.role === "patient" ? "PATIENT" : "MEDIKIOSK";
       return `${speaker}: ${message.text}`;
     })
     .join("\n");
 }
 
-function extractTopicFromQuestion(question) {
-  const normalized = normalizeText(question);
+/*
+  ==========================================================
+  getNextClinicalQuestion
+  ==========================================================
 
-  const topicNames = Object.keys(
-    MEMORY_TOPIC_KEYWORDS
-  );
+  Only job per call:
+    1. If a topic was just asked about (lastTopic), extract a
+       short factual value for it from the patient's latest
+       answer, and note any OTHER remaining topics the answer
+       already covers unprompted.
+    2. Choose exactly one topic out of `remainingTopics` (a list
+       the app computed — Gemini doesn't have to guess what's
+       left) and write one short natural question for it.
 
-  for (const topic of topicNames) {
-    const keywords =
-      MEMORY_TOPIC_KEYWORDS[topic];
-
-    if (
-      keywords.some((keyword) =>
-        normalized.includes(
-          normalizeText(keyword)
-        )
-      )
-    ) {
-      return topic;
-    }
-  }
-
-  return "general";
-}
-
-function questionAlreadyAsked(
-  question,
-  conversation
-) {
-  const normalizedQuestion =
-    normalizeText(question);
-
-  if (!normalizedQuestion) {
-    return true;
-  }
-
-  return conversation.some((message) => {
-    if (message.role !== "ai") {
-      return false;
-    }
-
-    const previous =
-      normalizeText(message.text);
-
-    if (!previous) {
-      return false;
-    }
-
-    if (previous === normalizedQuestion) {
-      return true;
-    }
-
-    const currentWords =
-      new Set(
-        normalizedQuestion
-          .split(" ")
-          .filter((word) => word.length > 2)
-      );
-
-    const previousWords =
-      new Set(
-        previous
-          .split(" ")
-          .filter((word) => word.length > 2)
-      );
-
-    if (
-      currentWords.size === 0 ||
-      previousWords.size === 0
-    ) {
-      return false;
-    }
-
-    let overlap = 0;
-
-    currentWords.forEach((word) => {
-      if (previousWords.has(word)) {
-        overlap += 1;
-      }
-    });
-
-    const similarity =
-      overlap /
-      Math.min(
-        currentWords.size,
-        previousWords.size
-      );
-
-    return similarity >= 0.8;
-  });
-}
-
-function topicAlreadyAnswered(
-  question,
-  interviewMemory
-) {
-  const topic =
-    extractTopicFromQuestion(question);
-
-  if (
-    topic === "general" ||
-    !interviewMemory
-  ) {
-    return false;
-  }
-
-  const value =
-    interviewMemory[topic];
-
-  return (
-    value !== undefined &&
-    value !== null &&
-    String(value).trim().length > 0
-  );
-}
-
-function isPatientCorrectingAI(text) {
-  const normalized = normalizeText(text);
-
-  const correctionPatterns = [
-    "already told",
-    "already said",
-    "i told you",
-    "i said",
-    "told you before",
-    "पहले ही बताया",
-    "मैंने बताया",
-    "पहले बताया",
-    "ఇప్పటికే చెప్పాను",
-    "చెప్పాను కదా",
-    "ఇప్పుడే చెప్పాను",
-    "முன்பே சொன்னேன்",
-    "ஏற்கனவே சொன்னேன்",
-  ];
-
-  return correctionPatterns.some((pattern) =>
-    normalized.includes(
-      normalizeText(pattern)
-    )
-  );
-}
-
-function updateInterviewMemory({
-  previousMemory,
-  modelClinical,
-  answer,
-  question,
-}) {
-  const memory = {
-    ...(previousMemory || {}),
-  };
-
-  const fields = [
-    "chiefComplaint",
-    "onset",
-    "location",
-    "character",
-    "severity",
-    "timing",
-    "radiation",
-    "aggravatingFactors",
-    "relievingFactors",
-    "associatedSymptoms",
-    "relevantHistory",
-  ];
-
-  fields.forEach((field) => {
-    const value =
-      modelClinical?.[field];
-
-    if (
-      value !== undefined &&
-      value !== null &&
-      String(value).trim()
-    ) {
-      memory[field] = String(value).trim();
-    }
-  });
-
-  const topic =
-    extractTopicFromQuestion(question);
-
-  if (
-    topic !== "general" &&
-    !memory[topic]
-  ) {
-    memory[topic] = answer;
-  }
-
-  if (!Array.isArray(memory.patientStatements)) {
-    memory.patientStatements = [];
-  }
-
-  memory.patientStatements = [
-    ...memory.patientStatements,
-    answer,
-  ].slice(-20);
-
-  return memory;
-}
-
+  The app treats every field in the response as advisory and
+  validates it before using it — see resolveNextStep() in the
+  component below.
+*/
 async function getNextClinicalQuestion({
   language,
   conversation,
-  patientData,
+  patientContext,
+  lastTopic,
+  remainingTopics,
   questionNumber,
-  symptomType,
-  interviewMemory,
 }) {
   const languageName = language || "English";
-
-  const transcript =
-    buildTranscript(conversation);
-
-  const patientContext =
-    getPatientContext(patientData);
-
-  const previousQuestions =
-    conversation
-      .filter(
-        (message) =>
-          message.role === "ai"
-      )
-      .map(
-        (message) => message.text
-      );
-
-  const knownInformation = Object.entries(
-    interviewMemory || {}
-  )
-    .filter(
-      ([key, value]) =>
-        key !== "patientStatements" &&
-        value !== undefined &&
-        value !== null &&
-        String(value).trim()
-    )
-    .map(
-      ([key, value]) =>
-        `- ${key}: ${value}`
-    )
-    .join("\n");
-
-  const patientStatements =
-    Array.isArray(
-      interviewMemory?.patientStatements
-    )
-      ? interviewMemory.patientStatements
-          .map(
-            (statement) =>
-              `- ${statement}`
-          )
-          .join("\n")
-      : "";
+  const transcript = buildTranscript(conversation);
 
   const prompt = `
 You are MediKiosk, an AI clinical HISTORY-TAKING assistant for a hospital prototype.
+You are NOT a doctor. Do not diagnose, treat, or recommend medicine.
 
-Your ONLY job is to collect and organize clinical history from a patient.
+The patient speaks ${languageName}. Reply with natural, short questions in ${languageName}.
 
-You are NOT a doctor.
-Do NOT diagnose.
-Do NOT recommend treatment.
-Do NOT prescribe medicines.
-Do NOT tell the patient what disease they have.
-Do NOT provide medical advice.
+PATIENT RECORD (prior information, not today's complaint):
+${JSON.stringify(patientContext, null, 2)}
 
-The patient is speaking in ${languageName}.
-
-==================================================
-MOST IMPORTANT RULE: MEMORY
-==================================================
-
-You have an explicit memory of information that has already
-been established during this interview.
-
-You MUST treat information under "ALREADY ESTABLISHED"
-as already answered.
-
-NEVER ask the patient for information that is already
-established.
-
-For example:
-
-ALREADY ESTABLISHED:
-- chiefComplaint: stomach pain
-- onset: 2 days ago
-
-You MUST NOT ask:
-"How long have you had the stomach pain?"
-
-You should explore something else that is clinically useful.
-
-Do NOT assume that a question needs to be asked merely because
-it is a common clinical-history question.
-
-Follow the patient's actual story.
-
-==================================================
-PATIENT RECORD
-==================================================
-
-The patient has an existing medical record.
-
-This record is PRIOR MEDICAL INFORMATION, not information about
-today's complaint.
-
-Use it only when it is clinically relevant.
-
-Do NOT repeatedly ask the patient about information already
-present in this medical record.
-
-Patient name:
-${patientContext.patientName || "Not available"}
-
-Age:
-${patientContext.age || "Not available"}
-
-Gender:
-${patientContext.gender || "Not available"}
-
-Previous medical history:
-${JSON.stringify(
-  patientContext.previousMedicalHistory || [],
-  null,
-  2
-)}
-
-Current medications:
-${JSON.stringify(
-  patientContext.currentMedications || [],
-  null,
-  2
-)}
-
-Allergies:
-${JSON.stringify(
-  patientContext.allergies || [],
-  null,
-  2
-)}
-
-Family history:
-${JSON.stringify(
-  patientContext.familyHistory || [],
-  null,
-  2
-)}
-
-Lifestyle:
-${JSON.stringify(
-  patientContext.lifestyle || [],
-  null,
-  2
-)}
-
-==================================================
-CONVERSATION PRINCIPLES
-==================================================
-
-1. Understand the patient's latest answer using the ENTIRE conversation.
-2. Remember facts the patient has already provided.
-3. Never repeat a question already asked.
-4. Never ask for information already clearly provided.
-5. Never ask the same thing using different wording.
-6. If the patient says "no", "లేదు", "नहीं", etc., treat that as a negative answer.
-7. Ask EXACTLY ONE patient-facing question.
-8. Keep the question short and natural.
-9. If the patient's answer is ambiguous, ask one focused clarification.
-10. If enough useful history has been collected, finish.
-11. Do not restart the interview.
-12. Do not follow a rigid checklist.
-13. Do not force duration, location, severity, radiation, etc. in a fixed order.
-14. Choose the SINGLE most useful unexplored area based on the patient's narrative.
-15. You may explore symptoms, context, triggers, impact, previous episodes,
-    relevant history, associated symptoms, or clarification as appropriate.
-16. The question should feel like a natural conversation.
-17. Maximum total AI follow-up questions: ${MAX_AI_FOLLOWUPS}.
-18. This is question number ${questionNumber}.
-19. Current symptom category inferred by the application: ${symptomType}.
-
-==================================================
-SOCRATIC + DASHAVIDHA GUIDANCE
-==================================================
-
-Use a Socratic style:
-- listen carefully to what the patient says
-- identify what is unclear
-- ask the next question that best clarifies the patient's own story
-- do not interrogate the patient with a checklist
-
-You may use the broad thinking principles behind Dashavidha Pariksha
-when they are naturally relevant, especially for AYUSH consultations.
-
-Do NOT force all ten dimensions.
-Do NOT ask them mechanically.
-Do NOT use unnecessary Ayurvedic terminology with the patient.
-
-There is NO mandatory question order.
-
-==================================================
-ALREADY ESTABLISHED INFORMATION
-==================================================
-
-${knownInformation || "No structured information established yet."}
-
-Patient statements already captured:
-
-${patientStatements || "No patient statements stored yet."}
-
-==================================================
-QUESTIONS ALREADY ASKED
-==================================================
-
-${
-  previousQuestions.length
-    ? previousQuestions
-        .map(
-          (question, index) =>
-            `${index + 1}. ${question}`
-        )
-        .join("\n")
-    : "None"
-}
-
-==================================================
-FULL CONVERSATION
-==================================================
-
+FULL CONVERSATION SO FAR:
 ${transcript || "No conversation yet."}
 
-==================================================
-PATIENT CONTEXT
-==================================================
-
-${JSON.stringify(
-  patientContext,
-  null,
-  2
-)}
+This is question number ${questionNumber} of at most ${MAX_AI_FOLLOWUPS}.
 
 ==================================================
-FINAL DECISION
+YOUR TWO JOBS, IN ORDER
 ==================================================
 
-Before choosing your question, silently check:
+JOB 1 — Only if "topicJustAsked" below is not null:
+Read the PATIENT's most recent message in the transcript above.
+It is the answer to the topic named in "topicJustAsked".
+Write a short factual value for that topic in "extractedValue"
+(a few words, in ${languageName} or English, whichever is clearer).
+If the patient's answer also clearly covers any OTHER topics
+from "remainingTopics" without being asked, list those topic
+keys in "additionalTopicsCovered" so we do not ask about them
+again.
 
-A. What has the patient already told me?
-B. What is already in ALREADY ESTABLISHED INFORMATION?
-C. What questions have already been asked?
-D. What information is still unclear or clinically useful?
-E. Is my proposed question asking for something already known?
-F. If yes, choose a different direction.
-G. Is the history already sufficient? If yes, finish.
+topicJustAsked: ${lastTopic ? `"${lastTopic}"` : "null"}
 
-IMPORTANT:
-The application will also reject a repeated/covered question.
-Therefore, do not intentionally return a question about an already
-answered topic.
+JOB 2 — Choose ONE topic key from this exact list and ask about
+it. Do not invent topic keys and do not repeat one that is not
+in this list — every topic in this list is confirmed NOT yet
+covered:
 
-Return ONLY valid JSON in exactly this structure:
+remainingTopics: ${JSON.stringify(remainingTopics)}
+
+If remainingTopics is empty, or the history already collected is
+clearly sufficient, set "isComplete": true instead and leave
+"nextTopic" / "nextQuestion" empty.
+
+Ask exactly ONE patient-facing question, short and natural, not
+a checklist. Do not explain yourself to the patient.
+
+If the patient's last message suggests something clinically
+urgent (e.g. chest pain with breathlessness, fainting,
+neurological symptoms, bleeding), put a short note in
+"redFlagConcern"; otherwise leave it empty.
+
+Return ONLY this JSON, nothing else, no markdown fences:
 
 {
+  "extractedValue": "",
+  "additionalTopicsCovered": [],
+  "redFlagConcern": "",
   "isComplete": false,
-  "nextQuestion": "one short question in ${languageName}",
-  "questionFocus": "brief topic such as location, character, associated symptoms, trigger, history, clarification, impact, etc.",
-  "informationAlreadyKnown": [
-    "brief fact already established"
-  ],
-  "clinicalUnderstanding": {
-    "chiefComplaint": "",
-    "onset": "",
-    "location": "",
-    "character": "",
-    "severity": "",
-    "timing": "",
-    "radiation": "",
-    "aggravatingFactors": "",
-    "relievingFactors": "",
-    "associatedSymptoms": "",
-    "relevantHistory": ""
-  },
-  "redFlagConcern": ""
+  "nextTopic": "",
+  "nextQuestion": ""
 }
-
-If the history is sufficiently collected:
-
-{
-  "isComplete": true,
-  "nextQuestion": "",
-  "questionFocus": "",
-  "informationAlreadyKnown": [
-    "brief fact already established"
-  ],
-  "clinicalUnderstanding": {
-    "chiefComplaint": "",
-    "onset": "",
-    "location": "",
-    "character": "",
-    "severity": "",
-    "timing": "",
-    "radiation": "",
-    "aggravatingFactors": "",
-    "relievingFactors": "",
-    "associatedSymptoms": "",
-    "relevantHistory": ""
-  },
-  "redFlagConcern": ""
-}
-
-Remember:
-ONE patient-facing question only.
-Do not repeat already established information.
-Do not use a rigid questionnaire.
 `;
 
-  const response =
-    await ai.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: prompt,
-      config: {
-        temperature: 0.35,
-      },
-    });
+  const response = await ai.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: prompt,
+    config: {
+      temperature: 0.3,
+    },
+  });
 
-  const parsed =
-    cleanGeminiJson(response.text);
+  const parsed = cleanGeminiJson(response.text);
 
   if (!parsed) {
-    throw new Error(
-      "Gemini returned an unexpected response format."
-    );
+    throw new Error("Gemini returned an unexpected response format.");
   }
 
   return parsed;
 }
 
-function QuestionsScreen({
-  patientData,
-  onUpdate,
-  onComplete,
-  onBack,
-}) {
-  const language =
-    patientData?.language || "English";
+function QuestionsScreen({ patientData, onUpdate, onComplete, onBack }) {
+  const language = patientData?.language || "English";
 
-  const config =
-    LANGUAGE_CONFIG[language] ||
-    LANGUAGE_CONFIG.English;
+  const config = LANGUAGE_CONFIG[language] || LANGUAGE_CONFIG.English;
 
-  const [conversation, setConversation] =
-    useState(
-      patientData?.conversationHistory ||
-        []
-    );
+  const [conversation, setConversation] = useState(
+    patientData?.conversationHistory || []
+  );
 
-  const [currentQuestion, setCurrentQuestion] =
-    useState("");
+  const [currentQuestion, setCurrentQuestion] = useState("");
+  const [currentAnswer, setCurrentAnswer] = useState("");
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
 
-  const [currentAnswer, setCurrentAnswer] =
-    useState("");
+  const [questionNumber, setQuestionNumber] = useState(
+    Math.max(1, Number(patientData?.questionCount || 1))
+  );
 
-  const [isListening, setIsListening] =
-    useState(false);
+  const [symptomType, setSymptomType] = useState("general");
 
-  const [isSpeaking, setIsSpeaking] =
-    useState(false);
+  const [redFlags, setRedFlags] = useState(patientData?.redFlags || []);
 
-  const [isThinking, setIsThinking] =
-    useState(false);
-
-  const [isPaused, setIsPaused] =
-    useState(false);
-
-  const [questionNumber, setQuestionNumber] =
-    useState(
-      Math.max(
-        1,
-        Number(
-          patientData?.questionCount || 1
-        )
-      )
-    );
-
-  const [symptomType, setSymptomType] =
-    useState("general");
-
-  const [redFlags, setRedFlags] =
-    useState(
-      patientData?.redFlags || []
-    );
-
-  const [interviewMemory, setInterviewMemory] =
-    useState(
-      patientData?.interviewMemory || {}
-    );
-
-  const [errorMessage, setErrorMessage] =
-    useState("");
+  const [errorMessage, setErrorMessage] = useState("");
 
   const recognitionRef = useRef(null);
   const silenceTimerRef = useRef(null);
@@ -1193,24 +658,32 @@ function QuestionsScreen({
   const processingRef = useRef(false);
   const mountedRef = useRef(true);
 
+  /*
+    Deterministic interview state. Refs, not React state, because
+    it is read and written from inside async callbacks
+    (recognition results, Gemini responses, TTS callbacks) where
+    stale render closures would otherwise cause exactly the kind
+    of bugs that made the old version repeat itself.
+  */
+  const topicAnswersRef = useRef({
+    ...(patientData?.topicAnswers || {}),
+  });
+  const topicInFlightRef = useRef(null);
+  const lastAskedQuestionRef = useRef("");
+
   const speechSupported =
-    typeof window !== "undefined" &&
-    "speechSynthesis" in window;
+    typeof window !== "undefined" && "speechSynthesis" in window;
 
   const recognitionSupported =
     typeof window !== "undefined" &&
-    ("SpeechRecognition" in window ||
-      "webkitSpeechRecognition" in window);
+    ("SpeechRecognition" in window || "webkitSpeechRecognition" in window);
 
-  const persistConversation = (
-    updatedConversation
-  ) => {
+  const getRemainingTopics = () =>
+    CLINICAL_TOPICS.filter((topic) => !topicAnswersRef.current[topic]);
+
+  const persistConversation = (updatedConversation) => {
     setConversation(updatedConversation);
-
-    onUpdate?.({
-      conversationHistory:
-        updatedConversation,
-    });
+    onUpdate?.({ conversationHistory: updatedConversation });
   };
 
   const addConversationMessage = (
@@ -1222,67 +695,40 @@ function QuestionsScreen({
       id: `${Date.now()}-${Math.random()}`,
       role,
       text,
-      timestamp:
-        new Date().toISOString(),
+      timestamp: new Date().toISOString(),
     };
 
-    const updatedConversation = [
-      ...baseConversation,
-      message,
-    ];
+    const updatedConversation = [...baseConversation, message];
 
-    persistConversation(
-      updatedConversation
-    );
+    persistConversation(updatedConversation);
 
-    return {
-      message,
-      conversation:
-        updatedConversation,
-    };
+    return { message, conversation: updatedConversation };
   };
 
-  const speak = (
-    text,
-    onFinished
-  ) => {
-    if (!text) {
-      onFinished?.();
-      return;
-    }
-
-    if (!speechSupported) {
+  const speak = (text, onFinished) => {
+    if (!text || !speechSupported) {
       onFinished?.();
       return;
     }
 
     window.speechSynthesis.cancel();
 
-    const utterance =
-      new SpeechSynthesisUtterance(text);
-
+    const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = config.code;
     utterance.rate = 0.88;
     utterance.pitch = 1;
     utterance.volume = 1;
 
-    const voices =
-      window.speechSynthesis.getVoices();
+    const voices = window.speechSynthesis.getVoices();
 
-    const matchingVoice =
-      voices.find((voice) =>
-        voice.lang
-          ?.toLowerCase()
-          .startsWith(
-            config.code
-              .toLowerCase()
-              .split("-")[0]
-          )
-      );
+    const matchingVoice = voices.find((voice) =>
+      voice.lang
+        ?.toLowerCase()
+        .startsWith(config.code.toLowerCase().split("-")[0])
+    );
 
     if (matchingVoice) {
-      utterance.voice =
-        matchingVoice;
+      utterance.voice = matchingVoice;
     }
 
     utterance.onstart = () => {
@@ -1295,7 +741,6 @@ function QuestionsScreen({
       if (mountedRef.current) {
         setIsSpeaking(false);
       }
-
       onFinished?.();
     };
 
@@ -1303,19 +748,14 @@ function QuestionsScreen({
       if (mountedRef.current) {
         setIsSpeaking(false);
       }
-
       onFinished?.();
     };
 
-    window.speechSynthesis.speak(
-      utterance
-    );
+    window.speechSynthesis.speak(utterance);
   };
 
   const stopListening = () => {
-    clearTimeout(
-      silenceTimerRef.current
-    );
+    clearTimeout(silenceTimerRef.current);
 
     if (recognitionRef.current) {
       try {
@@ -1350,11 +790,9 @@ function QuestionsScreen({
       }
 
       const SpeechRecognition =
-        window.SpeechRecognition ||
-        window.webkitSpeechRecognition;
+        window.SpeechRecognition || window.webkitSpeechRecognition;
 
-      const recognition =
-        new SpeechRecognition();
+      const recognition = new SpeechRecognition();
 
       recognition.lang = config.code;
       recognition.continuous = false;
@@ -1372,45 +810,27 @@ function QuestionsScreen({
         let finalText = "";
         let interimText = "";
 
-        for (
-          let i = event.resultIndex;
-          i < event.results.length;
-          i += 1
-        ) {
-          const transcript =
-            event.results[i][0]
-              ?.transcript || "";
+        for (let i = event.resultIndex; i < event.results.length; i += 1) {
+          const transcript = event.results[i][0]?.transcript || "";
 
-          if (
-            event.results[i].isFinal
-          ) {
+          if (event.results[i].isFinal) {
             finalText += transcript;
           } else {
             interimText += transcript;
           }
         }
 
-        const visibleText =
-          finalText || interimText;
+        const visibleText = finalText || interimText;
 
-        if (
-          visibleText &&
-          mountedRef.current
-        ) {
-          setCurrentAnswer(
-            visibleText
-          );
+        if (visibleText && mountedRef.current) {
+          setCurrentAnswer(visibleText);
         }
 
         if (finalText.trim()) {
-          clearTimeout(
-            silenceTimerRef.current
-          );
+          clearTimeout(silenceTimerRef.current);
 
           setTimeout(() => {
-            processAnswer(
-              finalText.trim()
-            );
+            processAnswer(finalText.trim());
           }, 300);
         }
       };
@@ -1422,10 +842,7 @@ function QuestionsScreen({
 
         setIsListening(false);
 
-        if (
-          event.error !== "aborted" &&
-          event.error !== "no-speech"
-        ) {
+        if (event.error !== "aborted" && event.error !== "no-speech") {
           setErrorMessage(
             "Voice input is unavailable. You can type your answer instead."
           );
@@ -1438,9 +855,7 @@ function QuestionsScreen({
         }
       };
 
-      recognitionRef.current =
-        recognition;
-
+      recognitionRef.current = recognition;
       recognition.start();
     } catch {
       if (mountedRef.current) {
@@ -1452,33 +867,34 @@ function QuestionsScreen({
     }
   };
 
-  const askQuestion = (
-    question,
-    baseConversation = conversation
-  ) => {
+  /*
+    Ask a question for a given topic (topic is null for the
+    opening question). Everything the answer-processing side
+    needs is written to refs HERE, synchronously, before any
+    speaking/listening starts — so there is no render-timing
+    window where stale data could leak into the next answer.
+  */
+  const askQuestion = (question, topic, baseConversation = conversation) => {
     if (!question || isPaused) {
       return;
     }
+
+    topicInFlightRef.current = topic;
+    lastAskedQuestionRef.current = question;
 
     setCurrentQuestion(question);
     setCurrentAnswer("");
     setIsThinking(false);
     setErrorMessage("");
 
-    const {
-      conversation:
-        updatedConversation,
-    } = addConversationMessage(
+    const { conversation: updatedConversation } = addConversationMessage(
       "ai",
       question,
       baseConversation
     );
 
     speak(question, () => {
-      if (
-        !mountedRef.current ||
-        isPaused
-      ) {
+      if (!mountedRef.current || isPaused) {
         return;
       }
 
@@ -1490,13 +906,52 @@ function QuestionsScreen({
     return updatedConversation;
   };
 
+  const buildPersistedFields = ({
+    updatedConversation,
+    updatedHistory,
+    updatedAnswers,
+    finalRedFlags,
+    finalClinicalContext,
+    finalSymptoms,
+    interviewStatus,
+  }) => ({
+    name: patientData?.name || DEMO_PATIENT_RECORD.name,
+    age: patientData?.age || DEMO_PATIENT_RECORD.age,
+    gender: patientData?.gender || DEMO_PATIENT_RECORD.gender,
+
+    previousMedicalHistory:
+      patientData?.previousMedicalHistory ||
+      DEMO_PATIENT_RECORD.previousMedicalHistory,
+
+    currentMedications:
+      patientData?.currentMedications ||
+      DEMO_PATIENT_RECORD.currentMedications,
+
+    allergies: patientData?.allergies || DEMO_PATIENT_RECORD.allergies,
+
+    familyHistory:
+      patientData?.familyHistory || DEMO_PATIENT_RECORD.familyHistory,
+
+    lifestyle: patientData?.lifestyle || DEMO_PATIENT_RECORD.lifestyle,
+
+    answers: updatedAnswers,
+    interviewHistory: updatedHistory,
+    conversationHistory: updatedConversation,
+    topicAnswers: { ...topicAnswersRef.current },
+    redFlags: finalRedFlags,
+    clinicalContext: finalClinicalContext,
+    symptoms: finalSymptoms,
+    interviewStatus,
+    answeredCount: updatedHistory.length,
+    questionCount: updatedHistory.length + 1,
+  });
+
   const finishInterview = ({
     history,
     answers,
     finalRedFlags,
     finalClinicalContext,
     finalSymptoms,
-    finalMemory,
     finalConversation,
   }) => {
     stopListening();
@@ -1507,259 +962,171 @@ function QuestionsScreen({
 
     setIsThinking(false);
 
-    const finalHistory =
-      history ||
-      patientData?.interviewHistory ||
-      [];
-
-    const finalAnswers =
-      answers ||
-      patientData?.answers ||
-      {};
+    const finalHistory = history || patientData?.interviewHistory || [];
+    const finalAnswers = answers || patientData?.answers || {};
 
     const completedRedFlags =
-      finalRedFlags ||
-      redFlags ||
-      patientData?.redFlags ||
-      [];
+      finalRedFlags || redFlags || patientData?.redFlags || [];
 
     const clinicalContext =
-      finalClinicalContext ||
-      patientData?.clinicalContext ||
-      {};
+      finalClinicalContext || patientData?.clinicalContext || {};
 
-    const symptoms =
-      finalSymptoms ||
-      patientData?.symptoms ||
-      [];
+    const symptoms = finalSymptoms || patientData?.symptoms || [];
 
-    const memory =
-      finalMemory ||
-      interviewMemory ||
-      patientData?.interviewMemory ||
-      {};
-
-    const historyConversation =
-      finalConversation ||
-      conversation;
+    const historyConversation = finalConversation || conversation;
 
     const finishedMessage = {
       id: `${Date.now()}-finished`,
       role: "ai",
       text: config.finished,
-      timestamp:
-        new Date().toISOString(),
+      timestamp: new Date().toISOString(),
     };
 
-    const completedConversation = [
-      ...historyConversation,
-      finishedMessage,
-    ];
+    const completedConversation = [...historyConversation, finishedMessage];
 
-    setConversation(
-      completedConversation
-    );
+    setConversation(completedConversation);
 
     onUpdate?.({
-      conversationHistory:
-        completedConversation,
-      interviewMemory: memory,
-
-      /*
-        Persist demo patient record so downstream screens
-        receive the exact same patient context.
-      */
-      name:
-        patientData?.name ||
-        DEMO_PATIENT_RECORD.name,
-
-      age:
-        patientData?.age ||
-        DEMO_PATIENT_RECORD.age,
-
-      gender:
-        patientData?.gender ||
-        DEMO_PATIENT_RECORD.gender,
-
-      previousMedicalHistory:
-        patientData?.previousMedicalHistory ||
-        DEMO_PATIENT_RECORD.previousMedicalHistory,
-
-      currentMedications:
-        patientData?.currentMedications ||
-        DEMO_PATIENT_RECORD.currentMedications,
-
-      allergies:
-        patientData?.allergies ||
-        DEMO_PATIENT_RECORD.allergies,
-
-      familyHistory:
-        patientData?.familyHistory ||
-        DEMO_PATIENT_RECORD.familyHistory,
-
-      lifestyle:
-        patientData?.lifestyle ||
-        DEMO_PATIENT_RECORD.lifestyle,
+      ...buildPersistedFields({
+        updatedConversation: completedConversation,
+        updatedHistory: finalHistory,
+        updatedAnswers: finalAnswers,
+        finalRedFlags: completedRedFlags,
+        finalClinicalContext: clinicalContext,
+        finalSymptoms: symptoms,
+        interviewStatus: "in_progress",
+      }),
     });
 
-    speak(
-      config.finished,
-      () => {
-        setTimeout(() => {
-          if (!mountedRef.current) {
-            return;
-          }
+    speak(config.finished, () => {
+      setTimeout(() => {
+        if (!mountedRef.current) {
+          return;
+        }
 
-          onComplete?.({
-            answers: finalAnswers,
-            interviewHistory:
-              finalHistory,
-            conversationHistory:
-              completedConversation,
-            interviewMemory:
-              memory,
-            redFlags:
-              completedRedFlags,
-            symptoms,
-            clinicalContext,
-            questionCount:
-              finalHistory.length,
-            answeredCount:
-              finalHistory.length,
-            interviewStatus:
-              "completed",
-            completedAt:
-              new Date().toISOString(),
-            priority:
-              completedRedFlags.length > 0
-                ? "review"
-                : "routine",
+        onComplete?.({
+          answers: finalAnswers,
+          interviewHistory: finalHistory,
+          conversationHistory: completedConversation,
+          topicAnswers: { ...topicAnswersRef.current },
+          redFlags: completedRedFlags,
+          symptoms,
+          clinicalContext,
+          questionCount: finalHistory.length,
+          answeredCount: finalHistory.length,
+          interviewStatus: "completed",
+          completedAt: new Date().toISOString(),
+          priority: completedRedFlags.length > 0 ? "review" : "routine",
 
-            /*
-              Carry complete demo patient record
-              into SummaryScreen and ReceiptScreen.
-            */
-            name:
-              patientData?.name ||
-              DEMO_PATIENT_RECORD.name,
+          name: patientData?.name || DEMO_PATIENT_RECORD.name,
+          age: patientData?.age || DEMO_PATIENT_RECORD.age,
+          gender: patientData?.gender || DEMO_PATIENT_RECORD.gender,
 
-            age:
-              patientData?.age ||
-              DEMO_PATIENT_RECORD.age,
+          previousMedicalHistory:
+            patientData?.previousMedicalHistory ||
+            DEMO_PATIENT_RECORD.previousMedicalHistory,
 
-            gender:
-              patientData?.gender ||
-              DEMO_PATIENT_RECORD.gender,
+          currentMedications:
+            patientData?.currentMedications ||
+            DEMO_PATIENT_RECORD.currentMedications,
 
-            previousMedicalHistory:
-              patientData?.previousMedicalHistory ||
-              DEMO_PATIENT_RECORD.previousMedicalHistory,
+          allergies: patientData?.allergies || DEMO_PATIENT_RECORD.allergies,
 
-            currentMedications:
-              patientData?.currentMedications ||
-              DEMO_PATIENT_RECORD.currentMedications,
+          familyHistory:
+            patientData?.familyHistory || DEMO_PATIENT_RECORD.familyHistory,
 
-            allergies:
-              patientData?.allergies ||
-              DEMO_PATIENT_RECORD.allergies,
-
-            familyHistory:
-              patientData?.familyHistory ||
-              DEMO_PATIENT_RECORD.familyHistory,
-
-            lifestyle:
-              patientData?.lifestyle ||
-              DEMO_PATIENT_RECORD.lifestyle,
-          });
-        }, 500);
-      }
-    );
+          lifestyle: patientData?.lifestyle || DEMO_PATIENT_RECORD.lifestyle,
+        });
+      }, 500);
+    });
   };
 
-  const processAnswer = async (
-    answer
-  ) => {
-    const cleanAnswer =
-      String(answer || "").trim();
+  /*
+    Deterministically resolve what happens next, given whatever
+    (possibly incomplete, possibly wrong) response Gemini gave
+    us. This is the piece that makes repeats structurally
+    impossible: nextTopic is only ever accepted if it is still
+    in the remaining list; otherwise the app itself advances the
+    checklist using a built-in question.
+  */
+  const resolveNextStep = (result, remainingTopics) => {
+    const wantsComplete = result?.isComplete === true;
 
-    if (
-      !cleanAnswer ||
-      isThinking ||
-      processingRef.current ||
-      isPaused
-    ) {
+    if (wantsComplete || remainingTopics.length === 0) {
+      return { done: true };
+    }
+
+    const candidateTopic = result?.nextTopic;
+
+    const topicIsValid =
+      typeof candidateTopic === "string" &&
+      remainingTopics.includes(candidateTopic);
+
+    const topic = topicIsValid ? candidateTopic : remainingTopics[0];
+
+    const candidateQuestion = String(result?.nextQuestion || "").trim();
+
+    const question =
+      topicIsValid && candidateQuestion
+        ? candidateQuestion
+        : TOPIC_FALLBACK_QUESTIONS[language]?.[topic] ||
+          TOPIC_FALLBACK_QUESTIONS.English[topic];
+
+    return { done: false, topic, question };
+  };
+
+  const processAnswer = async (answer) => {
+    const cleanAnswer = String(answer || "").trim();
+
+    if (!cleanAnswer || isThinking || processingRef.current || isPaused) {
       return;
     }
 
     processingRef.current = true;
-
     stopListening();
 
     setIsThinking(true);
     setCurrentAnswer(cleanAnswer);
     setErrorMessage("");
 
-    const detectedFlags =
-      detectRedFlags(cleanAnswer);
+    const askedQuestionText = lastAskedQuestionRef.current;
+    const topicJustAsked = topicInFlightRef.current;
 
-    const existingFlags =
-      patientData?.redFlags ||
-      redFlags ||
-      [];
-
-    const existingIds = new Set(
-      existingFlags.map(
-        (flag) => flag.id
-      )
-    );
-
-    const newFlags =
-      detectedFlags.filter(
-        (flag) =>
-          !existingIds.has(flag.id)
-      );
-
-    const mergedRedFlags = [
-      ...existingFlags,
-      ...newFlags,
-    ];
+    const detectedFlags = detectRedFlags(cleanAnswer);
+    const existingFlags = patientData?.redFlags || redFlags || [];
+    const existingIds = new Set(existingFlags.map((flag) => flag.id));
+    const newFlags = detectedFlags.filter((flag) => !existingIds.has(flag.id));
+    const mergedRedFlags = [...existingFlags, ...newFlags];
 
     const detectedType =
-      questionNumber === 1
-        ? detectSymptomType(
-            cleanAnswer
-          )
-        : symptomType;
+      questionNumber === 1 ? detectSymptomType(cleanAnswer) : symptomType;
 
-    if (
-      questionNumber === 1 &&
-      detectedType !== "general"
-    ) {
-      setSymptomType(
-        detectedType
-      );
+    if (questionNumber === 1 && detectedType !== "general") {
+      setSymptomType(detectedType);
+    }
+
+    // Question 1 is always the chief complaint — record it directly,
+    // no need to ask Gemini to extract something we already have verbatim.
+    if (questionNumber === 1) {
+      topicAnswersRef.current.chiefComplaint = cleanAnswer;
     }
 
     const answerRecord = {
-      question: currentQuestion,
+      question: askedQuestionText,
       answer: cleanAnswer,
-      questionIndex:
-        questionNumber - 1,
-      timestamp:
-        new Date().toISOString(),
+      questionIndex: questionNumber - 1,
+      timestamp: new Date().toISOString(),
     };
 
     const updatedHistory = [
-      ...(patientData?.interviewHistory ||
-        []),
+      ...(patientData?.interviewHistory || []),
       answerRecord,
     ];
 
     const updatedAnswers = {
       ...(patientData?.answers || {}),
       [`question_${questionNumber}`]: {
-        question:
-          currentQuestion,
+        question: askedQuestionText,
         answer: cleanAnswer,
       },
     };
@@ -1768,629 +1135,205 @@ function QuestionsScreen({
       id: `${Date.now()}-patient`,
       role: "patient",
       text: cleanAnswer,
-      timestamp:
-        new Date().toISOString(),
+      timestamp: new Date().toISOString(),
     };
 
-    const updatedConversation = [
-      ...conversation,
-      patientMessage,
-    ];
+    const updatedConversation = [...conversation, patientMessage];
+    setConversation(updatedConversation);
 
-    setConversation(
-      updatedConversation
-    );
+    const finishWithCurrentState = () => {
+      processingRef.current = false;
 
-    const baseClinicalContext = {
-      ...(patientData?.clinicalContext ||
-        {}),
-      ...(questionNumber === 1
-        ? {
-            chiefComplaint:
-              cleanAnswer,
-          }
-        : {}),
-    };
+      const finalClinicalContext = buildClinicalContext();
 
-    const preliminaryMemory =
-      updateInterviewMemory({
-        previousMemory:
-          interviewMemory,
-        modelClinical:
-          questionNumber === 1
-            ? {
-                chiefComplaint:
-                  cleanAnswer,
-              }
-            : {},
-        answer: cleanAnswer,
-        question: currentQuestion,
+      finishInterview({
+        history: updatedHistory,
+        answers: updatedAnswers,
+        finalRedFlags: mergedRedFlags,
+        finalClinicalContext,
+        finalSymptoms:
+          detectedType !== "general"
+            ? [detectedType]
+            : patientData?.symptoms || [],
+        finalConversation: updatedConversation,
       });
-
-    setInterviewMemory(
-      preliminaryMemory
-    );
-
-    const updatedPatientData = {
-      ...patientData,
-
-      /*
-        DEMO PATIENT DATA
-        Only fills fields that are not already present.
-      */
-      name:
-        patientData?.name ||
-        DEMO_PATIENT_RECORD.name,
-
-      age:
-        patientData?.age ||
-        DEMO_PATIENT_RECORD.age,
-
-      gender:
-        patientData?.gender ||
-        DEMO_PATIENT_RECORD.gender,
-
-      previousMedicalHistory:
-        patientData?.previousMedicalHistory ||
-        DEMO_PATIENT_RECORD.previousMedicalHistory,
-
-      currentMedications:
-        patientData?.currentMedications ||
-        DEMO_PATIENT_RECORD.currentMedications,
-
-      allergies:
-        patientData?.allergies ||
-        DEMO_PATIENT_RECORD.allergies,
-
-      familyHistory:
-        patientData?.familyHistory ||
-        DEMO_PATIENT_RECORD.familyHistory,
-
-      lifestyle:
-        patientData?.lifestyle ||
-        DEMO_PATIENT_RECORD.lifestyle,
-
-      answers: updatedAnswers,
-
-      interviewHistory:
-        updatedHistory,
-
-      conversationHistory:
-        updatedConversation,
-
-      redFlags:
-        mergedRedFlags,
-
-      symptoms:
-        detectedType !== "general"
-          ? [detectedType]
-          : patientData?.symptoms ||
-            [],
-
-      clinicalContext:
-        baseClinicalContext,
-
-      interviewMemory:
-        preliminaryMemory,
-
-      interviewStatus:
-        "in_progress",
-
-      answeredCount:
-        updatedHistory.length,
-
-      questionCount:
-        updatedHistory.length + 1,
     };
 
-    onUpdate?.({
-      /*
-        Persist patient record immediately.
-      */
-      name:
-        patientData?.name ||
-        DEMO_PATIENT_RECORD.name,
-
-      age:
-        patientData?.age ||
-        DEMO_PATIENT_RECORD.age,
-
-      gender:
-        patientData?.gender ||
-        DEMO_PATIENT_RECORD.gender,
-
-      previousMedicalHistory:
-        patientData?.previousMedicalHistory ||
-        DEMO_PATIENT_RECORD.previousMedicalHistory,
-
-      currentMedications:
-        patientData?.currentMedications ||
-        DEMO_PATIENT_RECORD.currentMedications,
-
-      allergies:
-        patientData?.allergies ||
-        DEMO_PATIENT_RECORD.allergies,
-
-      familyHistory:
-        patientData?.familyHistory ||
-        DEMO_PATIENT_RECORD.familyHistory,
-
-      lifestyle:
-        patientData?.lifestyle ||
-        DEMO_PATIENT_RECORD.lifestyle,
-
-      answers: updatedAnswers,
-
-      interviewHistory:
-        updatedHistory,
-
-      conversationHistory:
-        updatedConversation,
-
-      interviewMemory:
-        preliminaryMemory,
-
-      answeredCount:
-        updatedHistory.length,
-
-      questionCount:
-        updatedHistory.length + 1,
-
-      symptoms:
-        detectedType !== "general"
-          ? [detectedType]
-          : patientData?.symptoms ||
-            [],
-
-      redFlags:
-        mergedRedFlags,
-
-      clinicalContext:
-        baseClinicalContext,
-
-      interviewStatus:
-        "in_progress",
+    const buildClinicalContext = () => ({
+      ...(patientData?.clinicalContext || {}),
+      ...topicAnswersRef.current,
+      // Aliases some downstream screens look for by these exact names.
+      duration: topicAnswersRef.current.onset,
+      progression: topicAnswersRef.current.timing,
     });
 
-    setRedFlags(
-      mergedRedFlags
-    );
+    const advanceDeterministically = () => {
+      const remainingTopics = getRemainingTopics();
 
-    const correctionDetected =
-      isPatientCorrectingAI(
-        cleanAnswer
-      );
-
-    if (correctionDetected) {
-      preliminaryMemory.patientCorrection =
-        "The patient indicates that this information was already provided. Do not ask for the same information again.";
-    }
-
-    try {
-      const result =
-        await getNextClinicalQuestion({
-          language,
-          conversation:
-            updatedConversation,
-          patientData:
-            updatedPatientData,
-          questionNumber,
-          symptomType:
-            detectedType,
-          interviewMemory:
-            preliminaryMemory,
-        });
-
-      if (!mountedRef.current) {
+      if (remainingTopics.length === 0 || questionNumber >= MAX_AI_FOLLOWUPS) {
+        finishWithCurrentState();
         return;
       }
 
-      const modelClinical =
-        result?.clinicalUnderstanding ||
-        {};
+      const topic = remainingTopics[0];
+      const question =
+        TOPIC_FALLBACK_QUESTIONS[language]?.[topic] ||
+        TOPIC_FALLBACK_QUESTIONS.English[topic];
 
-      const updatedMemory =
-        updateInterviewMemory({
-          previousMemory:
-            preliminaryMemory,
-          modelClinical,
-          answer: cleanAnswer,
-          question:
-            currentQuestion,
-        });
+      persistProgress({ nextTopic: topic });
 
-      if (
-        correctionDetected
-      ) {
-        updatedMemory.patientCorrection =
-          "The patient indicated that information was already provided. Avoid repeating that topic.";
-      }
-
-      setInterviewMemory(
-        updatedMemory
-      );
-
-      const updatedClinicalContext = {
-        ...baseClinicalContext,
-        ...modelClinical,
-      };
-
-      const modelRedFlag =
-        result?.redFlagConcern;
-
-      let finalRedFlags =
-        mergedRedFlags;
-
-      if (
-        modelRedFlag &&
-        String(modelRedFlag)
-          .trim().length > 0
-      ) {
-        const aiFlag = {
-          id:
-            "ai-clinical-review",
-          label: String(
-            modelRedFlag
-          ).trim(),
-        };
-
-        const alreadyExists =
-          mergedRedFlags.some(
-            (flag) =>
-              flag.id ===
-              aiFlag.id
-          );
-
-        if (!alreadyExists) {
-          finalRedFlags = [
-            ...mergedRedFlags,
-            aiFlag,
-          ];
-
-          setRedFlags(
-            finalRedFlags
-          );
-        }
-      }
-
-      onUpdate?.({
-        name:
-          patientData?.name ||
-          DEMO_PATIENT_RECORD.name,
-
-        age:
-          patientData?.age ||
-          DEMO_PATIENT_RECORD.age,
-
-        gender:
-          patientData?.gender ||
-          DEMO_PATIENT_RECORD.gender,
-
-        previousMedicalHistory:
-          patientData?.previousMedicalHistory ||
-          DEMO_PATIENT_RECORD.previousMedicalHistory,
-
-        currentMedications:
-          patientData?.currentMedications ||
-          DEMO_PATIENT_RECORD.currentMedications,
-
-        allergies:
-          patientData?.allergies ||
-          DEMO_PATIENT_RECORD.allergies,
-
-        familyHistory:
-          patientData?.familyHistory ||
-          DEMO_PATIENT_RECORD.familyHistory,
-
-        lifestyle:
-          patientData?.lifestyle ||
-          DEMO_PATIENT_RECORD.lifestyle,
-
-        clinicalContext:
-          updatedClinicalContext,
-
-        interviewMemory:
-          updatedMemory,
-
-        redFlags:
-          finalRedFlags,
-
-        answers:
-          updatedAnswers,
-
-        interviewHistory:
-          updatedHistory,
-
-        conversationHistory:
-          updatedConversation,
-
-        answeredCount:
-          updatedHistory.length,
-
-        questionCount:
-          updatedHistory.length + 1,
-      });
-
-      const candidateQuestion =
-        String(
-          result?.nextQuestion || ""
-        ).trim();
-
-      const duplicate =
-        questionAlreadyAsked(
-          candidateQuestion,
-          updatedConversation
-        );
-
-      const covered =
-        topicAlreadyAnswered(
-          candidateQuestion,
-          updatedMemory
-        );
-
-      const shouldFinish =
-        result?.isComplete === true ||
-        !candidateQuestion ||
-        questionNumber >=
-          MAX_AI_FOLLOWUPS;
-
-      if (shouldFinish) {
-        processingRef.current = false;
-
-        finishInterview({
-          history:
-            updatedHistory,
-
-          answers:
-            updatedAnswers,
-
-          finalRedFlags,
-
-          finalClinicalContext:
-            updatedClinicalContext,
-
-          finalSymptoms:
-            detectedType !==
-            "general"
-              ? [detectedType]
-              : patientData?.symptoms ||
-                [],
-
-          finalMemory:
-            updatedMemory,
-
-          finalConversation:
-            updatedConversation,
-        });
-
-        return;
-      }
-
-      if (duplicate || covered) {
-        try {
-          const retryMemory = {
-            ...updatedMemory,
-
-            blockedQuestion:
-              candidateQuestion,
-
-            blockedReason:
-              duplicate
-                ? "This question was already asked."
-                : "This information has already been established.",
-          };
-
-          const retryResult =
-            await getNextClinicalQuestion({
-              language,
-
-              conversation:
-                updatedConversation,
-
-              patientData: {
-                ...updatedPatientData,
-
-                interviewMemory:
-                  retryMemory,
-              },
-
-              questionNumber,
-
-              symptomType:
-                detectedType,
-
-              interviewMemory:
-                retryMemory,
-            });
-
-          const retryQuestion =
-            String(
-              retryResult?.nextQuestion ||
-                ""
-            ).trim();
-
-          const retryDuplicate =
-            questionAlreadyAsked(
-              retryQuestion,
-              updatedConversation
-            );
-
-          const retryCovered =
-            topicAlreadyAnswered(
-              retryQuestion,
-              updatedMemory
-            );
-
-          if (
-            retryResult?.isComplete ===
-              true ||
-            !retryQuestion ||
-            retryDuplicate ||
-            retryCovered
-          ) {
-            processingRef.current =
-              false;
-
-            finishInterview({
-              history:
-                updatedHistory,
-
-              answers:
-                updatedAnswers,
-
-              finalRedFlags,
-
-              finalClinicalContext:
-                updatedClinicalContext,
-
-              finalSymptoms:
-                detectedType !==
-                "general"
-                  ? [detectedType]
-                  : patientData?.symptoms ||
-                    [],
-
-              finalMemory:
-                updatedMemory,
-
-              finalConversation:
-                updatedConversation,
-            });
-
-            return;
-          }
-
-          setQuestionNumber(
-            (previous) =>
-              previous + 1
-          );
-
-          setIsThinking(false);
-          processingRef.current =
-            false;
-
-          setTimeout(() => {
-            if (
-              !mountedRef.current
-            ) {
-              return;
-            }
-
-            askQuestion(
-              retryQuestion,
-              updatedConversation
-            );
-          }, 500);
-
-          return;
-        } catch (retryError) {
-          console.error(
-            "Gemini alternate question error:",
-            retryError
-          );
-
-          processingRef.current =
-            false;
-
-          finishInterview({
-            history:
-              updatedHistory,
-
-            answers:
-              updatedAnswers,
-
-            finalRedFlags,
-
-            finalClinicalContext:
-              updatedClinicalContext,
-
-            finalSymptoms:
-              detectedType !==
-              "general"
-                ? [detectedType]
-                : patientData?.symptoms ||
-                  [],
-
-            finalMemory:
-              updatedMemory,
-
-            finalConversation:
-              updatedConversation,
-          });
-
-          return;
-        }
-      }
-
-      setQuestionNumber(
-        (previous) =>
-          previous + 1
-      );
-
+      setQuestionNumber((previous) => previous + 1);
       setIsThinking(false);
-      processingRef.current =
-        false;
+      processingRef.current = false;
 
       setTimeout(() => {
         if (!mountedRef.current) {
           return;
         }
-
-        askQuestion(
-          candidateQuestion,
-          updatedConversation
-        );
+        askQuestion(question, topic, updatedConversation);
       }, 500);
-    } catch (error) {
-      console.error(
-        "Gemini clinical interview error:",
-        error
+    };
+
+    const persistProgress = ({ nextTopic }) => {
+      onUpdate?.(
+        buildPersistedFields({
+          updatedConversation,
+          updatedHistory,
+          updatedAnswers,
+          finalRedFlags: mergedRedFlags,
+          finalClinicalContext: buildClinicalContext(),
+          finalSymptoms:
+            detectedType !== "general"
+              ? [detectedType]
+              : patientData?.symptoms || [],
+          interviewStatus: "in_progress",
+        })
       );
+
+      void nextTopic; // reserved for future per-topic UI hints
+    };
+
+    try {
+      const remainingTopicsBeforeCall = getRemainingTopics();
+
+      const result = await getNextClinicalQuestion({
+        language,
+        conversation: updatedConversation,
+        patientContext: getPatientContext(patientData),
+        lastTopic: topicJustAsked,
+        remainingTopics: remainingTopicsBeforeCall,
+        questionNumber,
+      });
 
       if (!mountedRef.current) {
         return;
       }
 
-      setIsThinking(false);
-      processingRef.current = false;
+      // JOB 1 result: record the value for the topic we just asked about.
+      if (topicJustAsked) {
+        const extracted = String(result?.extractedValue || "").trim();
+        topicAnswersRef.current[topicJustAsked] = extracted || cleanAnswer;
+      }
 
-      setErrorMessage(
-        "I couldn't process that answer right now. Please try again or type your answer below."
-      );
-    }
-  };
+      if (Array.isArray(result?.additionalTopicsCovered)) {
+        result.additionalTopicsCovered.forEach((topic) => {
+          if (
+            CLINICAL_TOPICS.includes(topic) &&
+            !topicAnswersRef.current[topic]
+          ) {
+            topicAnswersRef.current[topic] = "Mentioned by patient earlier.";
+          }
+        });
+      }
 
-  const handleSubmitTypedAnswer =
-    () => {
-      const answer =
-        currentAnswer.trim();
+      let finalRedFlags = mergedRedFlags;
+      const modelRedFlag = result?.redFlagConcern;
 
-      if (
-        !answer ||
-        isThinking ||
-        processingRef.current
-      ) {
+      if (modelRedFlag && String(modelRedFlag).trim().length > 0) {
+        const aiFlag = {
+          id: "ai-clinical-review",
+          label: String(modelRedFlag).trim(),
+        };
+
+        if (!mergedRedFlags.some((flag) => flag.id === aiFlag.id)) {
+          finalRedFlags = [...mergedRedFlags, aiFlag];
+        }
+      }
+
+      setRedFlags(finalRedFlags);
+
+      const remainingTopicsAfterExtraction = getRemainingTopics();
+
+      const step = resolveNextStep(result, remainingTopicsAfterExtraction);
+
+      const finalClinicalContext = buildClinicalContext();
+
+      persistProgress({ nextTopic: step.topic });
+
+      if (step.done || questionNumber >= MAX_AI_FOLLOWUPS) {
+        processingRef.current = false;
+
+        finishInterview({
+          history: updatedHistory,
+          answers: updatedAnswers,
+          finalRedFlags,
+          finalClinicalContext,
+          finalSymptoms:
+            detectedType !== "general"
+              ? [detectedType]
+              : patientData?.symptoms || [],
+          finalConversation: updatedConversation,
+        });
+
         return;
       }
 
-      processAnswer(answer);
-    };
+      setQuestionNumber((previous) => previous + 1);
+      setIsThinking(false);
+      processingRef.current = false;
+
+      setTimeout(() => {
+        if (!mountedRef.current) {
+          return;
+        }
+        askQuestion(step.question, step.topic, updatedConversation);
+      }, 500);
+    } catch (error) {
+      console.error("Gemini clinical interview error:", error);
+
+      if (!mountedRef.current) {
+        return;
+      }
+
+      // Gemini failed outright — still make forward progress instead of
+      // getting stuck, using the checklist and built-in questions.
+      if (topicJustAsked && !topicAnswersRef.current[topicJustAsked]) {
+        topicAnswersRef.current[topicJustAsked] = cleanAnswer;
+      }
+
+      advanceDeterministically();
+    }
+  };
+
+  const handleSubmitTypedAnswer = () => {
+    const answer = currentAnswer.trim();
+
+    if (!answer || isThinking || processingRef.current) {
+      return;
+    }
+
+    processAnswer(answer);
+  };
 
   const togglePause = () => {
     if (isPaused) {
       setIsPaused(false);
 
       setTimeout(() => {
-        if (
-          speechSupported &&
-          currentQuestion
-        ) {
-          speak(
-            currentQuestion,
-            () => {
-              startListening();
-            }
-          );
+        if (speechSupported && currentQuestion) {
+          speak(currentQuestion, () => {
+            startListening();
+          });
         } else {
           startListening();
         }
@@ -2417,23 +1360,14 @@ function QuestionsScreen({
     startedRef.current = true;
 
     /*
-      Load fictional demo patient data into the active
-      patient record immediately.
-
-      If real patient fields already exist, they are preserved.
+      Load fictional demo patient data into the active patient
+      record immediately. If real patient fields already exist,
+      they are preserved.
     */
     const demoPatientData = {
-      name:
-        patientData?.name ||
-        DEMO_PATIENT_RECORD.name,
-
-      age:
-        patientData?.age ||
-        DEMO_PATIENT_RECORD.age,
-
-      gender:
-        patientData?.gender ||
-        DEMO_PATIENT_RECORD.gender,
+      name: patientData?.name || DEMO_PATIENT_RECORD.name,
+      age: patientData?.age || DEMO_PATIENT_RECORD.age,
+      gender: patientData?.gender || DEMO_PATIENT_RECORD.gender,
 
       previousMedicalHistory:
         patientData?.previousMedicalHistory ||
@@ -2443,110 +1377,70 @@ function QuestionsScreen({
         patientData?.currentMedications ||
         DEMO_PATIENT_RECORD.currentMedications,
 
-      allergies:
-        patientData?.allergies ||
-        DEMO_PATIENT_RECORD.allergies,
+      allergies: patientData?.allergies || DEMO_PATIENT_RECORD.allergies,
 
       familyHistory:
-        patientData?.familyHistory ||
-        DEMO_PATIENT_RECORD.familyHistory,
+        patientData?.familyHistory || DEMO_PATIENT_RECORD.familyHistory,
 
-      lifestyle:
-        patientData?.lifestyle ||
-        DEMO_PATIENT_RECORD.lifestyle,
+      lifestyle: patientData?.lifestyle || DEMO_PATIENT_RECORD.lifestyle,
     };
 
     onUpdate?.({
       ...demoPatientData,
-
-      interviewStatus:
-        "in_progress",
-
+      interviewStatus: "in_progress",
       questionCount: 1,
-
       answeredCount: 0,
-
-      interviewMemory:
-        patientData?.interviewMemory ||
-        {},
+      topicAnswers: { ...topicAnswersRef.current },
     });
 
     const welcomeMessage = {
       id: `${Date.now()}-welcome`,
       role: "ai",
       text: config.welcome,
-      timestamp:
-        new Date().toISOString(),
+      timestamp: new Date().toISOString(),
     };
 
-    const initialConversation = [
-      ...conversation,
-      welcomeMessage,
-    ];
+    const initialConversation = [...conversation, welcomeMessage];
 
-    setConversation(
-      initialConversation
-    );
+    setConversation(initialConversation);
+    onUpdate?.({ conversationHistory: initialConversation });
 
-    onUpdate?.({
-      conversationHistory:
-        initialConversation,
-    });
+    speak(config.welcome, () => {
+      if (!mountedRef.current) {
+        return;
+      }
 
-    speak(
-      config.welcome,
-      () => {
+      setTimeout(() => {
         if (!mountedRef.current) {
           return;
         }
-
-        setTimeout(() => {
-          if (!mountedRef.current) {
-            return;
-          }
-
-          askQuestion(
-            config.firstQuestion,
-            initialConversation
-          );
-        }, 500);
-      }
-    );
+        askQuestion(config.firstQuestion, null, initialConversation);
+      }, 500);
+    });
   };
 
   useEffect(() => {
     mountedRef.current = true;
 
-    if (
-      patientData?.interviewMemory
-    ) {
-      setInterviewMemory(
-        patientData.interviewMemory
-      );
+    if (patientData?.topicAnswers) {
+      topicAnswersRef.current = { ...patientData.topicAnswers };
     }
 
-    if (
-      patientData?.conversationHistory
-    ) {
-      setConversation(
-        patientData.conversationHistory
-      );
+    if (patientData?.conversationHistory) {
+      setConversation(patientData.conversationHistory);
     }
 
     startInterview();
 
     return () => {
       mountedRef.current = false;
-
       stopListening();
 
       if (speechSupported) {
         window.speechSynthesis.cancel();
       }
 
-      clearTimeout(
-        silenceTimerRef.current
-      );
+      clearTimeout(silenceTimerRef.current);
     };
 
     // Start only once when screen opens.
@@ -2555,11 +1449,7 @@ function QuestionsScreen({
 
   const progress = Math.min(
     95,
-    Math.round(
-      (questionNumber /
-        (MAX_AI_FOLLOWUPS + 1)) *
-        100
-    )
+    Math.round((questionNumber / (MAX_AI_FOLLOWUPS + 1)) * 100)
   );
 
   const statusText = isThinking
@@ -2570,29 +1460,18 @@ function QuestionsScreen({
         ? config.speaking
         : config.ready;
 
-  const patientName =
-    patientData?.name ||
-    DEMO_PATIENT_RECORD.name;
-
-  const patientAge =
-    patientData?.age ||
-    DEMO_PATIENT_RECORD.age;
-
-  const patientGender =
-    patientData?.gender ||
-    DEMO_PATIENT_RECORD.gender;
+  const patientName = patientData?.name || DEMO_PATIENT_RECORD.name;
+  const patientAge = patientData?.age || DEMO_PATIENT_RECORD.age;
+  const patientGender = patientData?.gender || DEMO_PATIENT_RECORD.gender;
 
   const previousMedicalHistory =
     patientData?.previousMedicalHistory ||
     DEMO_PATIENT_RECORD.previousMedicalHistory;
 
   const currentMedications =
-    patientData?.currentMedications ||
-    DEMO_PATIENT_RECORD.currentMedications;
+    patientData?.currentMedications || DEMO_PATIENT_RECORD.currentMedications;
 
-  const allergies =
-    patientData?.allergies ||
-    DEMO_PATIENT_RECORD.allergies;
+  const allergies = patientData?.allergies || DEMO_PATIENT_RECORD.allergies;
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -2605,13 +1484,9 @@ function QuestionsScreen({
             </div>
 
             <div>
-              <p className="font-bold text-slate-900">
-                MediKiosk
-              </p>
+              <p className="font-bold text-slate-900">MediKiosk</p>
 
-              <p className="text-xs text-slate-500">
-                AI Clinical Interview
-              </p>
+              <p className="text-xs text-slate-500">AI Clinical Interview</p>
             </div>
           </div>
 
@@ -2626,8 +1501,7 @@ function QuestionsScreen({
             </div>
 
             <div className="rounded-full bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-600">
-              {patientData?.consultationType ||
-                "Allopathic"}
+              {patientData?.consultationType || "Allopathic"}
             </div>
           </div>
         </div>
@@ -2656,9 +1530,7 @@ function QuestionsScreen({
           <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-100">
             <div
               className="h-full rounded-full bg-blue-600 transition-all duration-500"
-              style={{
-                width: `${progress}%`,
-              }}
+              style={{ width: `${progress}%` }}
             />
           </div>
         </div>
@@ -2682,8 +1554,7 @@ function QuestionsScreen({
               >
                 <Bot size={28} />
 
-                {(isListening ||
-                  isSpeaking) && (
+                {(isListening || isSpeaking) && (
                   <span className="absolute -right-1 -top-1 flex h-4 w-4">
                     <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-50" />
                     <span className="relative inline-flex h-4 w-4 rounded-full bg-blue-500" />
@@ -2693,92 +1564,65 @@ function QuestionsScreen({
 
               <div className="flex-1">
                 <div className="flex items-center gap-2">
-                  <p className="font-bold text-slate-900">
-                    MediKiosk AI
-                  </p>
+                  <p className="font-bold text-slate-900">MediKiosk AI</p>
 
                   <span className="rounded-full bg-blue-50 px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-blue-600">
                     AI
                   </span>
                 </div>
 
-                <p className="mt-1 text-sm text-slate-500">
-                  {statusText}
-                </p>
+                <p className="mt-1 text-sm text-slate-500">{statusText}</p>
               </div>
 
               <button
                 type="button"
                 onClick={togglePause}
                 className="rounded-xl border border-slate-200 p-3 text-slate-500 transition hover:bg-slate-50"
-                title={
-                  isPaused
-                    ? "Resume"
-                    : "Pause"
-                }
+                title={isPaused ? "Resume" : "Pause"}
               >
-                {isPaused ? (
-                  <Play size={18} />
-                ) : (
-                  <Pause size={18} />
-                )}
+                {isPaused ? <Play size={18} /> : <Pause size={18} />}
               </button>
             </div>
           </div>
 
           {/* Messages */}
           <div className="flex-1 space-y-5 overflow-y-auto px-6 py-6">
-            {conversation.map(
-              (message) => (
+            {conversation.map((message) => (
+              <div
+                key={message.id}
+                className={`flex ${
+                  message.role === "patient" ? "justify-end" : "justify-start"
+                }`}
+              >
                 <div
-                  key={message.id}
-                  className={`flex ${
-                    message.role ===
-                    "patient"
-                      ? "justify-end"
-                      : "justify-start"
+                  className={`max-w-[85%] rounded-2xl px-5 py-4 ${
+                    message.role === "patient"
+                      ? "rounded-br-md bg-blue-600 text-white"
+                      : "rounded-bl-md bg-slate-100 text-slate-800"
                   }`}
                 >
-                  <div
-                    className={`max-w-[85%] rounded-2xl px-5 py-4 ${
-                      message.role ===
-                      "patient"
-                        ? "rounded-br-md bg-blue-600 text-white"
-                        : "rounded-bl-md bg-slate-100 text-slate-800"
-                    }`}
-                  >
-                    <div className="mb-2 flex items-center gap-2">
-                      {message.role ===
-                      "patient" ? (
-                        <Mic size={14} />
-                      ) : (
-                        <Sparkles
-                          size={14}
-                        />
-                      )}
+                  <div className="mb-2 flex items-center gap-2">
+                    {message.role === "patient" ? (
+                      <Mic size={14} />
+                    ) : (
+                      <Sparkles size={14} />
+                    )}
 
-                      <span
-                        className={`text-[10px] font-bold uppercase tracking-wider ${
-                          message.role ===
-                          "patient"
-                            ? "text-blue-100"
-                            : "text-slate-400"
-                        }`}
-                      >
-                        {message.role ===
-                        "patient"
-                          ? "You"
-                          : "MediKiosk"}
-                      </span>
-                    </div>
-
-                    <p className="text-sm leading-7">
-                      {message.text}
-                    </p>
+                    <span
+                      className={`text-[10px] font-bold uppercase tracking-wider ${
+                        message.role === "patient"
+                          ? "text-blue-100"
+                          : "text-slate-400"
+                      }`}
+                    >
+                      {message.role === "patient" ? "You" : "MediKiosk"}
+                    </span>
                   </div>
+
+                  <p className="text-sm leading-7">{message.text}</p>
                 </div>
-              )
-            )}
+              </div>
+            ))}
 
             {isThinking && (
               <div className="flex justify-start">
@@ -2788,18 +1632,12 @@ function QuestionsScreen({
 
                     <span
                       className="h-2 w-2 animate-bounce rounded-full bg-slate-400"
-                      style={{
-                        animationDelay:
-                          "120ms",
-                      }}
+                      style={{ animationDelay: "120ms" }}
                     />
 
                     <span
                       className="h-2 w-2 animate-bounce rounded-full bg-slate-400"
-                      style={{
-                        animationDelay:
-                          "240ms",
-                      }}
+                      style={{ animationDelay: "240ms" }}
                     />
                   </div>
                 </div>
@@ -2816,8 +1654,7 @@ function QuestionsScreen({
               </div>
 
               <p className="text-lg font-semibold leading-8 text-slate-900">
-                {currentQuestion ||
-                  config.firstQuestion}
+                {currentQuestion || config.firstQuestion}
               </p>
             </div>
 
@@ -2825,22 +1662,14 @@ function QuestionsScreen({
             <div className="mt-4 flex flex-col items-center">
               <button
                 type="button"
-                onClick={
-                  isListening
-                    ? stopListening
-                    : startListening
-                }
-                disabled={
-                  isThinking ||
-                  isPaused
-                }
+                onClick={isListening ? stopListening : startListening}
+                disabled={isThinking || isPaused}
                 className={`relative flex h-20 w-20 items-center justify-center rounded-full text-white shadow-lg transition ${
                   isListening
                     ? "bg-red-500 shadow-red-500/20 hover:bg-red-600"
                     : "bg-blue-600 shadow-blue-600/20 hover:bg-blue-700"
                 } ${
-                  isThinking ||
-                  isPaused
+                  isThinking || isPaused
                     ? "cursor-not-allowed opacity-40"
                     : ""
                 }`}
@@ -2856,14 +1685,10 @@ function QuestionsScreen({
               </button>
 
               <p className="mt-3 text-sm font-semibold text-slate-700">
-                {isListening
-                  ? "Tap to stop listening"
-                  : "Tap to speak"}
+                {isListening ? "Tap to stop listening" : "Tap to speak"}
               </p>
 
-              <p className="mt-1 text-xs text-slate-400">
-                {config.fallback}
-              </p>
+              <p className="mt-1 text-xs text-slate-400">{config.fallback}</p>
             </div>
 
             {/* Text fallback */}
@@ -2876,16 +1701,9 @@ function QuestionsScreen({
 
                 <input
                   value={currentAnswer}
-                  onChange={(event) =>
-                    setCurrentAnswer(
-                      event.target.value
-                    )
-                  }
+                  onChange={(event) => setCurrentAnswer(event.target.value)}
                   onKeyDown={(event) => {
-                    if (
-                      event.key ===
-                      "Enter"
-                    ) {
+                    if (event.key === "Enter") {
                       handleSubmitTypedAnswer();
                     }
                   }}
@@ -2897,28 +1715,18 @@ function QuestionsScreen({
 
               <button
                 type="button"
-                onClick={
-                  handleSubmitTypedAnswer
-                }
-                disabled={
-                  !currentAnswer.trim() ||
-                  isThinking
-                }
+                onClick={handleSubmitTypedAnswer}
+                disabled={!currentAnswer.trim() || isThinking}
                 className="flex items-center gap-2 rounded-xl bg-slate-900 px-5 py-3.5 text-sm font-bold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 Send
-                <ChevronRight
-                  size={17}
-                />
+                <ChevronRight size={17} />
               </button>
             </div>
 
             {errorMessage && (
               <div className="mt-3 flex items-start gap-2 rounded-xl bg-amber-50 p-3 text-xs leading-5 text-amber-700">
-                <AlertTriangle
-                  size={15}
-                  className="mt-0.5 shrink-0"
-                />
+                <AlertTriangle size={15} className="mt-0.5 shrink-0" />
                 {errorMessage}
               </div>
             )}
@@ -2940,8 +1748,7 @@ function QuestionsScreen({
                 </p>
 
                 <p className="mt-1 text-xs text-slate-500">
-                  {patientAge} years •{" "}
-                  {patientGender}
+                  {patientAge} years • {patientGender}
                 </p>
               </div>
 
@@ -2957,16 +1764,11 @@ function QuestionsScreen({
                 </p>
 
                 <div className="mt-2 space-y-1.5">
-                  {previousMedicalHistory.map(
-                    (item) => (
-                      <p
-                        key={item}
-                        className="text-xs leading-5 text-slate-600"
-                      >
-                        {item}
-                      </p>
-                    )
-                  )}
+                  {previousMedicalHistory.map((item) => (
+                    <p key={item} className="text-xs leading-5 text-slate-600">
+                      {item}
+                    </p>
+                  ))}
                 </div>
               </div>
 
@@ -2976,16 +1778,11 @@ function QuestionsScreen({
                 </p>
 
                 <div className="mt-2 space-y-1.5">
-                  {currentMedications.map(
-                    (item) => (
-                      <p
-                        key={item}
-                        className="text-xs leading-5 text-slate-600"
-                      >
-                        {item}
-                      </p>
-                    )
-                  )}
+                  {currentMedications.map((item) => (
+                    <p key={item} className="text-xs leading-5 text-slate-600">
+                      {item}
+                    </p>
+                  ))}
                 </div>
               </div>
 
@@ -3009,21 +1806,15 @@ function QuestionsScreen({
               </div>
 
               <div>
-                <p className="font-bold text-slate-900">
-                  Voice assistant
-                </p>
+                <p className="font-bold text-slate-900">Voice assistant</p>
 
-                <p className="text-xs text-slate-500">
-                  {config.code}
-                </p>
+                <p className="text-xs text-slate-500">{config.code}</p>
               </div>
             </div>
 
             <div
               className={`rounded-2xl p-4 ${
-                isListening
-                  ? "bg-emerald-50"
-                  : "bg-slate-50"
+                isListening ? "bg-emerald-50" : "bg-slate-50"
               }`}
             >
               <div className="flex items-center gap-3">
@@ -3034,18 +1825,12 @@ function QuestionsScreen({
                       : "bg-white text-slate-500"
                   }`}
                 >
-                  {isListening ? (
-                    <Mic size={17} />
-                  ) : (
-                    <MicOff size={17} />
-                  )}
+                  {isListening ? <Mic size={17} /> : <MicOff size={17} />}
                 </div>
 
                 <div>
                   <p className="text-sm font-bold text-slate-800">
-                    {isListening
-                      ? "Listening"
-                      : "Microphone ready"}
+                    {isListening ? "Listening" : "Microphone ready"}
                   </p>
 
                   <p className="text-xs text-slate-500">
@@ -3063,9 +1848,7 @@ function QuestionsScreen({
             <div className="rounded-3xl border border-amber-200 bg-amber-50 p-5">
               <div className="flex items-start gap-3">
                 <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-700">
-                  <AlertTriangle
-                    size={20}
-                  />
+                  <AlertTriangle size={20} />
                 </div>
 
                 <div>
@@ -3074,30 +1857,25 @@ function QuestionsScreen({
                   </p>
 
                   <p className="mt-1 text-xs leading-5 text-amber-800">
-                    Information requiring
-                    clinician review has
-                    been detected.
+                    Information requiring clinician review has been detected.
                   </p>
                 </div>
               </div>
 
               <div className="mt-4 space-y-2">
-                {redFlags.map(
-                  (flag) => (
-                    <div
-                      key={flag.id}
-                      className="rounded-xl bg-white/70 p-3 text-xs font-medium text-amber-900"
-                    >
-                      {flag.label}
-                    </div>
-                  )
-                )}
+                {redFlags.map((flag) => (
+                  <div
+                    key={flag.id}
+                    className="rounded-xl bg-white/70 p-3 text-xs font-medium text-amber-900"
+                  >
+                    {flag.label}
+                  </div>
+                ))}
               </div>
 
               <p className="mt-4 text-[11px] leading-5 text-amber-700">
-                This is not a diagnosis.
-                Please ask a clinician
-                to review this information.
+                This is not a diagnosis. Please ask a clinician to review this
+                information.
               </p>
             </div>
           )}
@@ -3105,10 +1883,7 @@ function QuestionsScreen({
           {/* What AI is doing */}
           <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
             <div className="mb-4 flex items-center gap-2">
-              <Sparkles
-                size={17}
-                className="text-blue-600"
-              />
+              <Sparkles size={17} className="text-blue-600" />
 
               <p className="font-bold text-slate-900">
                 What MediKiosk is doing
@@ -3117,10 +1892,7 @@ function QuestionsScreen({
 
             <div className="space-y-3">
               {[
-                {
-                  icon: CheckCircle2,
-                  text: "Listening to your answer",
-                },
+                { icon: CheckCircle2, text: "Listening to your answer" },
                 {
                   icon: CheckCircle2,
                   text: "Remembering information already provided",
@@ -3129,19 +1901,12 @@ function QuestionsScreen({
                   icon: CheckCircle2,
                   text: "Choosing a relevant follow-up",
                 },
-                {
-                  icon: FileText,
-                  text: "Building your clinical history",
-                },
+                { icon: FileText, text: "Building your clinical history" },
               ].map((item) => {
-                const Icon =
-                  item.icon;
+                const Icon = item.icon;
 
                 return (
-                  <div
-                    key={item.text}
-                    className="flex items-start gap-3"
-                  >
+                  <div key={item.text} className="flex items-start gap-3">
                     <Icon
                       size={16}
                       className="mt-0.5 shrink-0 text-emerald-500"
@@ -3170,10 +1935,8 @@ function QuestionsScreen({
                 </p>
 
                 <p className="mt-1 text-xs leading-5 text-blue-800">
-                  MediKiosk is designed
-                  so patients can complete
-                  the interview mainly by
-                  listening and speaking.
+                  MediKiosk is designed so patients can complete the
+                  interview mainly by listening and speaking.
                 </p>
               </div>
             </div>
@@ -3199,11 +1962,7 @@ function StethoscopeIcon() {
       <path d="M6 3v5a6 6 0 0 0 12 0V3" />
       <path d="M3 3h3M18 3h3" />
       <path d="M12 14v4a4 4 0 0 0 8 0v-1" />
-      <circle
-        cx="20"
-        cy="15"
-        r="1"
-      />
+      <circle cx="20" cy="15" r="1" />
     </svg>
   );
 }
