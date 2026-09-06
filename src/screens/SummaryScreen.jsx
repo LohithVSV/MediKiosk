@@ -2,8 +2,11 @@ import { useMemo } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
+  Activity,
+  CalendarDays,
   CheckCircle2,
   ClipboardCheck,
+  Clock3,
   FileText,
   HeartPulse,
   History,
@@ -13,22 +16,22 @@ import {
   Sparkles,
   Stethoscope,
   UserRound,
+  Thermometer,
+  Weight,
+  Droplets,
+  Cigarette,
+  Wine,
+  Users,
+  Printer,
+  ChevronRight,
 } from "lucide-react";
 
-const SECTION_ICONS = {
-  "Chief Complaint": HeartPulse,
-  "History of Present Illness": History,
-  "Associated Symptoms": Sparkles,
-  "Relevant Negatives": CheckCircle2,
-  "Past Medical History": History,
-  Medications: Pill,
-  Allergies: ShieldAlert,
-  "Family History": UserRound,
-  Lifestyle: HeartPulse,
-};
+/* =========================================================
+   HELPERS
+========================================================= */
 
 function cleanAnswer(answer) {
-  if (!answer) return "";
+  if (answer === null || answer === undefined) return "";
 
   return String(answer)
     .replace(/\s+/g, " ")
@@ -41,10 +44,10 @@ function getAnswers(patientData) {
   if (history.length > 0) {
     return history
       .map((item) => ({
-        question: cleanAnswer(item.question),
-        answer: cleanAnswer(item.answer),
+        question: cleanAnswer(item?.question),
+        answer: cleanAnswer(item?.answer),
       }))
-      .filter((item) => item.answer);
+      .filter((item) => item.question && item.answer);
   }
 
   const answers = patientData?.answers || {};
@@ -54,44 +57,93 @@ function getAnswers(patientData) {
       question: cleanAnswer(item?.question),
       answer: cleanAnswer(item?.answer),
     }))
-    .filter((item) => item.answer);
+    .filter((item) => item.question && item.answer);
+}
+
+function matchesQuestion(question, keywords) {
+  const text = cleanAnswer(question).toLowerCase();
+
+  return keywords.some((keyword) =>
+    text.includes(keyword.toLowerCase())
+  );
 }
 
 function findAnswer(answers, keywords) {
   const item = answers.find((entry) =>
-    keywords.some((keyword) =>
-      entry.question
-        .toLowerCase()
-        .includes(keyword.toLowerCase())
-    )
+    matchesQuestion(entry.question, keywords)
   );
 
   return item?.answer || "";
 }
 
-function buildClinicalSummary(patientData, answers) {
+function findAllAnswers(answers, keywords) {
+  return answers
+    .filter((entry) =>
+      matchesQuestion(entry.question, keywords)
+    )
+    .map((entry) => entry.answer)
+    .filter(Boolean);
+}
+
+function unique(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function formatDate(value) {
+  if (!value) return "Not available";
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return date.toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+/* =========================================================
+   CLINICAL DATA EXTRACTION
+========================================================= */
+
+function buildClinicalData(patientData, answers) {
   const context = patientData?.clinicalContext || {};
+  const patient = patientData?.patient || {};
 
   const chiefComplaint =
     context.chiefComplaint ||
+    patientData?.chiefComplaint ||
     answers[0]?.answer ||
     "Not clearly documented";
 
   const duration =
     context.duration ||
+    patientData?.duration ||
     findAnswer(answers, [
       "when did",
+      "how long",
       "started",
-      "begin",
+      "start",
+      "since when",
+      "duration",
       "कब शुरू",
+      "कितने समय",
       "ఎప్పుడు ప్రారంభ",
+      "ఎంతకాలం",
       "எப்போது தொடங்க",
+      "எவ்வளவு நாட்களாக",
     ]);
 
   const severity =
     context.severity ||
+    patientData?.severity ||
     findAnswer(answers, [
       "severity",
+      "how severe",
+      "pain level",
       "0 to 10",
       "0 से 10",
       "0 నుండి 10",
@@ -100,10 +152,15 @@ function buildClinicalSummary(patientData, answers) {
 
   const progression =
     context.progression ||
+    patientData?.progression ||
     findAnswer(answers, [
       "better",
       "worse",
+      "getting worse",
+      "getting better",
       "same",
+      "changed",
+      "progress",
       "बेहतर",
       "बढ़",
       "घट",
@@ -113,56 +170,385 @@ function buildClinicalSummary(patientData, answers) {
       "அதிகரிக்க",
     ]);
 
-  const associated = answers
-    .filter(
-      (entry) =>
-        entry.question
-          .toLowerCase()
-          .includes("other symptoms") ||
-        entry.question.includes("अन्य लक्षण") ||
-        entry.question.includes("ఇతర లక్షణ") ||
-        entry.question.includes("வேறு ஏதேனும் அறிகுற")
-    )
-    .map((entry) => entry.answer);
+  const location =
+    context.location ||
+    findAnswer(answers, [
+      "where is",
+      "where does",
+      "location",
+      "which part",
+      "pain located",
+      "कहां",
+      "कहाँ",
+      "किस जगह",
+      "ఎక్కడ",
+      "ఏ ప్రాంతం",
+      "எங்கே",
+      "எந்த பகுதியில்",
+    ]);
+
+  const character =
+    context.character ||
+    findAnswer(answers, [
+      "what does the pain feel",
+      "type of pain",
+      "kind of pain",
+      "describe the pain",
+      "burning",
+      "sharp",
+      "dull",
+      "throbbing",
+      "pain feel",
+      "दर्द कैसा",
+      "నొప్పి ఎలా",
+      "வலி எப்படி",
+    ]);
+
+  const radiation =
+    context.radiation ||
+    findAnswer(answers, [
+      "spread",
+      "spreads",
+      "move to another",
+      "moves to another",
+      "radiat",
+      "another area",
+      "दूसरी जगह",
+      "फैल",
+      "మరొక ప్రాంత",
+      "వెళ్తుందా",
+      "வேறு இடத்திற்கு",
+      "பரவ",
+    ]);
+
+  const associatedSymptoms = unique(
+    findAllAnswers(answers, [
+      "other symptoms",
+      "associated symptoms",
+      "anything else",
+      "any other",
+      "अन्य लक्षण",
+      "कोई और लक्षण",
+      "ఇతర లక్షణ",
+      "వేరే లక్షణ",
+      "வேறு ஏதேனும் அறிகுற",
+      "மற்ற அறிகுற",
+    ])
+  );
+
+  const pastMedicalHistory = unique(
+    findAllAnswers(answers, [
+      "medical history",
+      "past history",
+      "previous illness",
+      "previous disease",
+      "any disease",
+      "diabetes",
+      "hypertension",
+      "blood pressure",
+      "asthma",
+      "heart disease",
+      "kidney",
+      "liver",
+      "मेडिकल हिस्ट्री",
+      "पहले कोई बीमारी",
+      "पुरानी बीमारी",
+      "వైద్య చరిత్ర",
+      "మునుపటి వ్యాధి",
+      "பழைய மருத்துவ",
+      "முன்னர் நோய்",
+    ])
+  );
+
+  const medications = unique(
+    findAllAnswers(answers, [
+      "medication",
+      "medicines",
+      "medicine",
+      "taking any",
+      "currently taking",
+      "tablets",
+      "drugs",
+      "दवा",
+      "दवाइयां",
+      "दवाएं",
+      "మందులు",
+      "మందు",
+      "மருந்து",
+      "மருந்துகள்",
+    ])
+  );
+
+  const allergies = unique(
+    findAllAnswers(answers, [
+      "allergy",
+      "allergic",
+      "allergies",
+      "drug allergy",
+      "medicine allergy",
+      "दवा से एलर्जी",
+      "एलर्जी",
+      "అలెర్జీ",
+      "మందులకు అలెర్జీ",
+      "ஒவ்வாமை",
+      "மருந்து ஒவ்வாமை",
+    ])
+  );
+
+  const familyHistory = unique(
+    findAllAnswers(answers, [
+      "family history",
+      "family member",
+      "runs in your family",
+      "hereditary",
+      "mother",
+      "father",
+      "parents",
+      "परिवार में",
+      "पारिवारिक",
+      "కుటుంబ చరిత్ర",
+      "కుటుంబంలో",
+      "குடும்ப வரலாறு",
+      "குடும்பத்தில்",
+    ])
+  );
+
+  const lifestyle = unique(
+    findAllAnswers(answers, [
+      "smoking",
+      "smoke",
+      "tobacco",
+      "alcohol",
+      "drinking",
+      "occupation",
+      "job",
+      "work",
+      "exercise",
+      "diet",
+      "smoker",
+      "धूम्रपान",
+      "शराब",
+      "तंबाकू",
+      "काम",
+      "व्यवसाय",
+      "धूम्रपान",
+      "పొగ",
+      "ధూమపానం",
+      "మద్యం",
+      "ఉద్యోగం",
+      "పని",
+      "புகை",
+      "மது",
+      "வேலை",
+    ])
+  );
 
   return {
+    patient,
     chiefComplaint,
     duration,
     severity,
     progression,
-    associatedSymptoms:
-      associated.length > 0
-        ? associated.join(" ")
-        : "No additional associated symptoms documented.",
+    location,
+    character,
+    radiation,
+    associatedSymptoms,
+    pastMedicalHistory,
+    medications,
+    allergies,
+    familyHistory,
+    lifestyle,
   };
 }
 
-function SummarySection({
-  title,
-  content,
+/* =========================================================
+   VITALS
+========================================================= */
+
+function getVitals(patientData, answers) {
+  const vitals = patientData?.vitals || {};
+
+  return {
+    bloodPressure:
+      vitals.bloodPressure ||
+      vitals.bp ||
+      findAnswer(answers, [
+        "blood pressure",
+        "bp",
+        "బ్లడ్ ప్రెజర్",
+      ]),
+
+    heartRate:
+      vitals.heartRate ||
+      vitals.pulse ||
+      findAnswer(answers, [
+        "heart rate",
+        "pulse",
+        "నాడి",
+      ]),
+
+    temperature:
+      vitals.temperature ||
+      vitals.temp ||
+      findAnswer(answers, [
+        "temperature",
+        "fever temperature",
+        "తాపం",
+        "జ్వరం ఉష్ణోగ్రత",
+      ]),
+
+    oxygenSaturation:
+      vitals.oxygenSaturation ||
+      vitals.spo2 ||
+      findAnswer(answers, [
+        "oxygen saturation",
+        "spo2",
+        "oxygen level",
+        "ఆక్సిజన్",
+      ]),
+
+    weight:
+      vitals.weight ||
+      findAnswer(answers, [
+        "weight",
+        "బరువు",
+        "वजन",
+      ]),
+
+    height:
+      vitals.height ||
+      findAnswer(answers, [
+        "height",
+        "ఎత్తు",
+        "ऊंचाई",
+      ]),
+  };
+}
+
+/* =========================================================
+   COMPONENTS
+========================================================= */
+
+function StatCard({
   icon: Icon,
+  label,
+  value,
+  subtle = false,
 }) {
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-      <div className="mb-4 flex items-center gap-3">
-        <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
-          <Icon size={19} />
+    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="flex items-center gap-3">
+        <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-50 text-slate-600">
+          <Icon size={18} />
         </div>
 
-        <h3 className="font-bold text-slate-900">
-          {title}
-        </h3>
+        <div className="min-w-0">
+          <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+            {label}
+          </p>
+
+          <p
+            className={`mt-1 truncate text-sm font-bold ${
+              subtle
+                ? "text-slate-500"
+                : "text-slate-900"
+            }`}
+          >
+            {value || "Not recorded"}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClinicalSection({
+  title,
+  icon: Icon,
+  children,
+  badge,
+}) {
+  return (
+    <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+      <div className="mb-5 flex items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
+            <Icon size={19} />
+          </div>
+
+          <h3 className="font-bold text-slate-900">
+            {title}
+          </h3>
+        </div>
+
+        {badge && (
+          <span className="rounded-full bg-slate-100 px-3 py-1 text-[10px] font-bold text-slate-500">
+            {badge}
+          </span>
+        )}
       </div>
 
-      <p className="text-sm leading-7 text-slate-600">
-        {content || "Not documented during this interview."}
-      </p>
+      {children}
     </section>
   );
 }
 
+function ClinicalValue({
+  label,
+  value,
+}) {
+  return (
+    <div className="rounded-2xl bg-slate-50 p-4">
+      <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+        {label}
+      </p>
+
+      <p className="mt-2 text-sm font-semibold leading-6 text-slate-800">
+        {value || "Not documented"}
+      </p>
+    </div>
+  );
+}
+
+function DataList({
+  values,
+  emptyText,
+}) {
+  if (!values || values.length === 0) {
+    return (
+      <p className="text-sm leading-6 text-slate-500">
+        {emptyText}
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {values.map((item, index) => (
+        <div
+          key={`${item}-${index}`}
+          className="flex items-start gap-3 rounded-xl bg-slate-50 p-3"
+        >
+          <CheckCircle2
+            size={16}
+            className="mt-0.5 shrink-0 text-emerald-500"
+          />
+
+          <p className="text-sm leading-6 text-slate-700">
+            {item}
+          </p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* =========================================================
+   MAIN SCREEN
+========================================================= */
+
 function SummaryScreen({
-  patientData,
+  patientData = {},
   onContinue,
   onBack,
   onNewConsultation,
@@ -172,20 +558,38 @@ function SummaryScreen({
     [patientData]
   );
 
-  const clinicalSummary = useMemo(
-    () =>
-      buildClinicalSummary(
-        patientData,
-        answers
-      ),
+  const clinical = useMemo(
+    () => buildClinicalData(patientData, answers),
+    [patientData, answers]
+  );
+
+  const vitals = useMemo(
+    () => getVitals(patientData, answers),
     [patientData, answers]
   );
 
   const redFlags = patientData?.redFlags || [];
 
   const patientName =
-    patientData?.patient?.name ||
+    clinical.patient?.name ||
+    patientData?.patientName ||
     "Registered Patient";
+
+  const patientAge =
+    clinical.patient?.age ||
+    patientData?.age ||
+    "—";
+
+  const patientGender =
+    clinical.patient?.gender ||
+    patientData?.gender ||
+    "—";
+
+  const patientId =
+    clinical.patient?.id ||
+    clinical.patient?.patientId ||
+    patientData?.patientId ||
+    "MK-PATIENT";
 
   const consultationType =
     patientData?.consultationType ||
@@ -198,6 +602,12 @@ function SummaryScreen({
   const sessionId =
     patientData?.sessionId ||
     "MK-SESSION";
+
+  const priority =
+    patientData?.priority ||
+    (redFlags.length > 0
+      ? "review"
+      : "routine");
 
   const interviewDuration = useMemo(() => {
     if (
@@ -232,17 +642,53 @@ function SummaryScreen({
     patientData?.completedAt,
   ]);
 
-  const priority =
-    patientData?.priority ||
-    (redFlags.length > 0
-      ? "review"
-      : "routine");
+  const synthesis = [
+    clinical.chiefComplaint !==
+      "Not clearly documented"
+      ? `Patient presents with ${clinical.chiefComplaint}.`
+      : "",
+
+    clinical.duration
+      ? `Symptoms have been present for ${clinical.duration}.`
+      : "",
+
+    clinical.location
+      ? `Reported location: ${clinical.location}.`
+      : "",
+
+    clinical.character
+      ? `Pain/symptom character: ${clinical.character}.`
+      : "",
+
+    clinical.severity
+      ? `Reported severity: ${clinical.severity}.`
+      : "",
+
+    clinical.progression
+      ? `Course: ${clinical.progression}.`
+      : "",
+
+    clinical.radiation
+      ? `Radiation/spread: ${clinical.radiation}.`
+      : "",
+
+    clinical.associatedSymptoms.length > 0
+      ? `Associated symptoms: ${clinical.associatedSymptoms.join(
+          "; "
+        )}.`
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
-    <div className="min-h-screen bg-slate-50">
-      {/* Header */}
-      <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
+    <div className="min-h-screen bg-slate-100">
+      {/* =====================================================
+          HEADER
+      ===================================================== */}
+
+      <header className="sticky top-0 z-20 border-b border-slate-200 bg-white">
+        <div className="mx-auto flex max-w-[1500px] items-center justify-between px-6 py-4">
           <div className="flex items-center gap-3">
             <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-600 text-white shadow-sm">
               <Stethoscope size={22} />
@@ -252,28 +698,32 @@ function SummaryScreen({
               <p className="font-bold text-slate-900">
                 MediKiosk
               </p>
+
               <p className="text-xs text-slate-500">
-                Clinical Summary
+                Doctor Clinical Dashboard
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-3">
-            <div className="hidden rounded-full bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-600 sm:block">
+            <span className="hidden rounded-full bg-slate-100 px-3 py-2 text-xs font-semibold text-slate-600 sm:block">
               {consultationType}
-            </div>
+            </span>
 
-            <div className="rounded-full bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700">
+            <span className="rounded-full bg-emerald-50 px-3 py-2 text-xs font-bold text-emerald-700">
               Interview complete
-            </div>
+            </span>
           </div>
         </div>
       </header>
 
-      {/* Main */}
-      <main className="mx-auto max-w-7xl px-6 py-8">
-        {/* Top actions */}
-        <div className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      {/* =====================================================
+          MAIN
+      ===================================================== */}
+
+      <main className="mx-auto max-w-[1500px] px-6 py-7">
+        {/* Navigation */}
+        <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <button
             type="button"
             onClick={onBack}
@@ -285,85 +735,124 @@ function SummaryScreen({
 
           <div className="flex items-center gap-3">
             <div className="rounded-xl bg-white px-4 py-2.5 text-xs font-semibold text-slate-500 shadow-sm">
-              Session:{" "}
+              Session{" "}
               <span className="text-slate-800">
                 {sessionId}
               </span>
             </div>
+
+            <button
+              type="button"
+              onClick={() => window.print()}
+              className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-xs font-bold text-slate-600 shadow-sm transition hover:bg-slate-50"
+            >
+              <Printer size={15} />
+              Print
+            </button>
           </div>
         </div>
 
-        {/* Title */}
-        <div className="mb-8">
-          <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-blue-50 px-3 py-1.5 text-xs font-bold text-blue-700">
-            <Sparkles size={14} />
-            AI-generated clinical history
-          </div>
+        {/* ===================================================
+            PATIENT HEADER
+        =================================================== */}
 
-          <h1 className="text-4xl font-bold tracking-tight text-slate-900">
-            Patient Summary
-          </h1>
-
-          <p className="mt-2 max-w-3xl text-base leading-7 text-slate-600">
-            MediKiosk has converted the patient&apos;s
-            conversation into a structured clinical history
-            for clinician review.
-          </p>
-        </div>
-
-        {/* Patient overview */}
         <section className="mb-6 rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-          <div className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
-            <div className="flex items-center gap-4">
-              <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-blue-50 text-blue-600">
-                <UserRound size={30} />
+          <div className="flex flex-col gap-6 xl:flex-row xl:items-center xl:justify-between">
+            <div className="flex items-center gap-5">
+              <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-2xl bg-blue-50 text-blue-600">
+                <UserRound size={34} />
               </div>
 
               <div>
-                <p className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                  Patient
-                </p>
+                <div className="flex flex-wrap items-center gap-3">
+                  <h1 className="text-2xl font-bold text-slate-900">
+                    {patientName}
+                  </h1>
 
-                <h2 className="mt-1 text-2xl font-bold text-slate-900">
-                  {patientName}
-                </h2>
+                  <span
+                    className={`rounded-full px-3 py-1 text-[10px] font-bold ${
+                      priority === "review"
+                        ? "bg-amber-100 text-amber-800"
+                        : "bg-emerald-100 text-emerald-800"
+                    }`}
+                  >
+                    {priority === "review"
+                      ? "REVIEW REQUIRED"
+                      : "ROUTINE"}
+                  </span>
+                </div>
 
-                <p className="mt-1 text-sm text-slate-500">
-                  Existing hospital record • {language} •{" "}
-                  {consultationType}
-                </p>
+                <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2 text-xs text-slate-500">
+                  <span>
+                    Patient ID:{" "}
+                    <strong className="text-slate-700">
+                      {patientId}
+                    </strong>
+                  </span>
+
+                  <span>
+                    Age:{" "}
+                    <strong className="text-slate-700">
+                      {patientAge}
+                    </strong>
+                  </span>
+
+                  <span>
+                    Gender:{" "}
+                    <strong className="text-slate-700">
+                      {patientGender}
+                    </strong>
+                  </span>
+
+                  <span>
+                    Language:{" "}
+                    <strong className="text-slate-700">
+                      {language}
+                    </strong>
+                  </span>
+                </div>
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              <InfoCard
-                label="Questions"
-                value={
-                  patientData?.answeredCount ||
-                  answers.length
-                }
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <StatCard
+                icon={FileText}
+                label="Responses"
+                value={answers.length}
               />
 
-              <InfoCard
-                label="Duration"
+              <StatCard
+                icon={Clock3}
+                label="Interview"
                 value={interviewDuration}
               />
 
-              <InfoCard
+              <StatCard
+                icon={CalendarDays}
+                label="Date"
+                value={formatDate(
+                  patientData?.completedAt
+                )}
+              />
+
+              <StatCard
+                icon={Activity}
                 label="Priority"
                 value={
                   priority === "review"
                     ? "Review"
                     : "Routine"
                 }
-                danger={priority === "review"}
               />
             </div>
           </div>
         </section>
 
-        {/* Clinical concern */}
-        {redFlags.length > 0 ? (
+        {/* ===================================================
+            RED FLAGS
+        =================================================== */}
+
+        {redFlags.length > 0 && (
           <section className="mb-6 rounded-3xl border border-amber-300 bg-amber-50 p-6">
             <div className="flex items-start gap-4">
               <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-amber-100 text-amber-700">
@@ -374,25 +863,28 @@ function SummaryScreen({
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <h2 className="font-bold text-amber-950">
-                      Potential clinical concerns detected
+                      Clinical attention required
                     </h2>
 
                     <p className="mt-1 text-sm leading-6 text-amber-800">
-                      These findings are based on the patient&apos;s
-                      reported answers and require clinician review.
+                      Potential concern indicators were
+                      identified during the patient interview.
                     </p>
                   </div>
 
                   <span className="w-fit rounded-full bg-amber-200 px-3 py-1.5 text-xs font-bold text-amber-900">
-                    Review required
+                    {redFlags.length} flag
+                    {redFlags.length !== 1
+                      ? "s"
+                      : ""}
                   </span>
                 </div>
 
                 <div className="mt-5 grid gap-3 md:grid-cols-2">
-                  {redFlags.map((flag) => (
+                  {redFlags.map((flag, index) => (
                     <div
-                      key={flag.id}
-                      className="rounded-2xl border border-amber-200 bg-white/70 p-4"
+                      key={flag.id || index}
+                      className="rounded-2xl border border-amber-200 bg-white/80 p-4"
                     >
                       <div className="flex items-start gap-3">
                         <AlertTriangle
@@ -400,9 +892,20 @@ function SummaryScreen({
                           className="mt-0.5 shrink-0 text-amber-600"
                         />
 
-                        <p className="text-sm font-semibold leading-6 text-amber-950">
-                          {flag.label}
-                        </p>
+                        <div>
+                          <p className="text-sm font-bold leading-6 text-amber-950">
+                            {flag.label ||
+                              flag.message ||
+                              flag.text ||
+                              "Potential concern detected"}
+                          </p>
+
+                          {flag.detail && (
+                            <p className="mt-1 text-xs leading-5 text-amber-800">
+                              {flag.detail}
+                            </p>
+                          )}
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -415,151 +918,269 @@ function SummaryScreen({
                   />
 
                   <p>
-                    This is a screening flag, not a diagnosis.
-                    The treating clinician should independently
-                    assess the patient.
+                    These are screening indicators based
+                    on reported information, not diagnoses.
+                    Clinical assessment remains with the
+                    treating doctor.
                   </p>
                 </div>
-              </div>
-            </div>
-          </section>
-        ) : (
-          <section className="mb-6 rounded-3xl border border-emerald-200 bg-emerald-50 p-5">
-            <div className="flex items-center gap-3">
-              <CheckCircle2
-                size={22}
-                className="text-emerald-600"
-              />
-
-              <div>
-                <p className="font-bold text-emerald-900">
-                  No automated clinical concern flags detected
-                </p>
-
-                <p className="mt-1 text-xs text-emerald-700">
-                  This does not rule out illness. Continue with
-                  normal clinician assessment.
-                </p>
               </div>
             </div>
           </section>
         )}
 
-        {/* Main summary grid */}
-        <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
-          <div className="space-y-5">
-            {/* Chief complaint */}
-            <section className="rounded-3xl border border-blue-200 bg-blue-50 p-6 shadow-sm">
-              <div className="mb-4 flex items-center gap-3">
-                <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-blue-600 text-white">
-                  <HeartPulse size={21} />
-                </div>
+        {/* ===================================================
+            CLINICAL OVERVIEW
+        =================================================== */}
 
-                <div>
-                  <p className="text-xs font-bold uppercase tracking-wider text-blue-500">
-                    Chief complaint
-                  </p>
+        <div className="mb-6 grid gap-5 md:grid-cols-2 xl:grid-cols-4">
+          <ClinicalValue
+            label="Chief Complaint"
+            value={clinical.chiefComplaint}
+          />
 
-                  <h2 className="mt-1 text-xl font-bold text-blue-950">
-                    {clinicalSummary.chiefComplaint}
-                  </h2>
+          <ClinicalValue
+            label="Duration"
+            value={clinical.duration}
+          />
+
+          <ClinicalValue
+            label="Severity"
+            value={clinical.severity}
+          />
+
+          <ClinicalValue
+            label="Progression"
+            value={clinical.progression}
+          />
+        </div>
+
+        {/* ===================================================
+            DASHBOARD GRID
+        =================================================== */}
+
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_390px]">
+          {/* =================================================
+              LEFT MAIN CLINICAL COLUMN
+          ================================================= */}
+
+          <div className="space-y-6">
+            {/* Chief Complaint */}
+            <ClinicalSection
+              title="Presenting Complaint"
+              icon={HeartPulse}
+              badge="PRIMARY CONCERN"
+            >
+              <div className="rounded-2xl border border-blue-100 bg-blue-50 p-5">
+                <p className="text-xs font-bold uppercase tracking-wider text-blue-500">
+                  Chief complaint
+                </p>
+
+                <h2 className="mt-2 text-2xl font-bold text-blue-950">
+                  {clinical.chiefComplaint}
+                </h2>
+
+                <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                  <ClinicalValue
+                    label="Duration"
+                    value={clinical.duration}
+                  />
+
+                  <ClinicalValue
+                    label="Location"
+                    value={clinical.location}
+                  />
+
+                  <ClinicalValue
+                    label="Character"
+                    value={clinical.character}
+                  />
+
+                  <ClinicalValue
+                    label="Radiation"
+                    value={clinical.radiation}
+                  />
                 </div>
               </div>
-
-              <div className="grid gap-3 sm:grid-cols-3">
-                <MiniClinicalCard
-                  label="Duration"
-                  value={
-                    clinicalSummary.duration ||
-                    "Not documented"
-                  }
-                />
-
-                <MiniClinicalCard
-                  label="Severity"
-                  value={
-                    clinicalSummary.severity ||
-                    "Not documented"
-                  }
-                />
-
-                <MiniClinicalCard
-                  label="Progression"
-                  value={
-                    clinicalSummary.progression ||
-                    "Not documented"
-                  }
-                />
-              </div>
-            </section>
+            </ClinicalSection>
 
             {/* HPI */}
-            <SummarySection
+            <ClinicalSection
               title="History of Present Illness"
               icon={History}
-              content={
-                answers.length > 0
-                  ? answers
-                      .slice(0, 7)
-                      .map(
-                        (item) =>
-                          `${item.question}: ${item.answer}`
-                      )
-                      .join(" ")
-                  : "No interview responses were recorded."
-              }
-            />
+              badge={`${answers.length} RESPONSES`}
+            >
+              <div className="rounded-2xl bg-slate-50 p-5">
+                <p className="text-sm leading-7 text-slate-700">
+                  {answers.length > 0
+                    ? answers
+                        .slice(0, 10)
+                        .map(
+                          (item) =>
+                            `${item.question}: ${item.answer}`
+                        )
+                        .join(" ")
+                    : "No interview responses were recorded."}
+                </p>
+              </div>
+            </ClinicalSection>
 
-            <SummarySection
+            {/* Associated Symptoms */}
+            <ClinicalSection
               title="Associated Symptoms"
               icon={Sparkles}
-              content={
-                clinicalSummary.associatedSymptoms
-              }
-            />
+            >
+              <DataList
+                values={clinical.associatedSymptoms}
+                emptyText="No additional associated symptoms were specifically documented."
+              />
+            </ClinicalSection>
 
             {/* Relevant negatives */}
-            <SummarySection
+            <ClinicalSection
               title="Relevant Negatives"
               icon={CheckCircle2}
-              content={
-                "Negative findings should be confirmed and interpreted by the clinician from the complete interview record."
-              }
-            />
+            >
+              <div className="rounded-2xl bg-emerald-50 p-5">
+                <div className="flex items-start gap-3">
+                  <CheckCircle2
+                    size={20}
+                    className="mt-0.5 shrink-0 text-emerald-600"
+                  />
 
-            <SummarySection
+                  <p className="text-sm leading-6 text-emerald-900">
+                    Review the interview record for
+                    patient-reported negative findings.
+                    Negative responses should be clinically
+                    interpreted and confirmed by the doctor.
+                  </p>
+                </div>
+              </div>
+            </ClinicalSection>
+
+            {/* Past medical history */}
+            <ClinicalSection
               title="Past Medical History"
               icon={History}
-              content="Existing medical history can be reviewed from the patient record. No additional past medical history was specifically captured in this interview."
-            />
+            >
+              <DataList
+                values={clinical.pastMedicalHistory}
+                emptyText="No additional past medical history was specifically captured during this interview."
+              />
+            </ClinicalSection>
 
-            <SummarySection
-              title="Medications"
+            {/* Medications */}
+            <ClinicalSection
+              title="Current Medications"
               icon={Pill}
-              content="Medication information should be verified against the patient's existing medical record and current medication list."
-            />
+            >
+              <DataList
+                values={clinical.medications}
+                emptyText="No medication information was specifically captured. Verify against the current medication list."
+              />
+            </ClinicalSection>
 
-            <SummarySection
+            {/* Allergies */}
+            <ClinicalSection
               title="Allergies"
               icon={ShieldAlert}
-              content="Allergy information should be verified against the patient's existing medical record."
-            />
+            >
+              {clinical.allergies.length > 0 ? (
+                <DataList
+                  values={clinical.allergies}
+                  emptyText=""
+                />
+              ) : (
+                <div className="rounded-2xl bg-emerald-50 p-5">
+                  <div className="flex items-center gap-3">
+                    <CheckCircle2
+                      size={20}
+                      className="text-emerald-600"
+                    />
 
-            <SummarySection
-              title="Family History"
-              icon={UserRound}
-              content="No additional family history was specifically captured during this interview."
-            />
+                    <div>
+                      <p className="font-bold text-emerald-900">
+                        No allergy information captured
+                      </p>
 
-            <SummarySection
-              title="Lifestyle"
-              icon={HeartPulse}
-              content="Lifestyle and social history should be confirmed by the clinician where clinically relevant."
-            />
+                      <p className="mt-1 text-xs text-emerald-700">
+                        Verify allergy status against the
+                        patient record.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </ClinicalSection>
+
+            {/* Family + lifestyle */}
+            <div className="grid gap-6 md:grid-cols-2">
+              <ClinicalSection
+                title="Family History"
+                icon={Users}
+              >
+                <DataList
+                  values={clinical.familyHistory}
+                  emptyText="No additional family history was captured."
+                />
+              </ClinicalSection>
+
+              <ClinicalSection
+                title="Lifestyle / Social"
+                icon={Cigarette}
+              >
+                <DataList
+                  values={clinical.lifestyle}
+                  emptyText="No additional lifestyle or social history was captured."
+                />
+              </ClinicalSection>
+            </div>
           </div>
 
-          {/* Right column */}
-          <aside className="space-y-5">
+          {/* =================================================
+              RIGHT DOCTOR SIDEBAR
+          ================================================= */}
+
+          <aside className="space-y-6">
+            {/* Vitals */}
+            <ClinicalSection
+              title="Vitals & Measurements"
+              icon={Activity}
+              badge="IF AVAILABLE"
+            >
+              <div className="grid gap-3">
+                <VitalRow
+                  icon={Activity}
+                  label="Blood Pressure"
+                  value={vitals.bloodPressure}
+                />
+
+                <VitalRow
+                  icon={HeartPulse}
+                  label="Heart Rate"
+                  value={vitals.heartRate}
+                />
+
+                <VitalRow
+                  icon={Thermometer}
+                  label="Temperature"
+                  value={vitals.temperature}
+                />
+
+                <VitalRow
+                  icon={Droplets}
+                  label="SpO₂"
+                  value={vitals.oxygenSaturation}
+                />
+
+                <VitalRow
+                  icon={Weight}
+                  label="Weight"
+                  value={vitals.weight}
+                />
+              </div>
+            </ClinicalSection>
+
             {/* AI synthesis */}
             <section className="rounded-3xl border border-blue-200 bg-white p-6 shadow-sm">
               <div className="mb-5 flex items-center gap-3">
@@ -573,26 +1194,15 @@ function SummaryScreen({
                   </p>
 
                   <p className="text-xs text-slate-500">
-                    Conversation-based overview
+                    Documentation aid
                   </p>
                 </div>
               </div>
 
               <div className="rounded-2xl bg-slate-50 p-5">
                 <p className="text-sm leading-7 text-slate-700">
-                  The patient reported{" "}
-                  <strong>
-                    {clinicalSummary.chiefComplaint}
-                  </strong>
-                  {clinicalSummary.duration
-                    ? `, beginning ${clinicalSummary.duration}.`
-                    : "."}{" "}
-                  {clinicalSummary.severity
-                    ? `Reported severity: ${clinicalSummary.severity}.`
-                    : ""}{" "}
-                  {clinicalSummary.progression
-                    ? `The reported progression was ${clinicalSummary.progression}.`
-                    : ""}
+                  {synthesis ||
+                    "Insufficient interview data to generate a clinical synthesis."}
                 </p>
               </div>
 
@@ -604,8 +1214,9 @@ function SummaryScreen({
                   />
 
                   <p className="text-xs leading-5 text-blue-800">
-                    This synthesis summarizes reported information.
-                    It is not a diagnosis or treatment recommendation.
+                    This summarizes patient-reported
+                    information and is not a diagnosis or
+                    treatment recommendation.
                   </p>
                 </div>
               </div>
@@ -620,11 +1231,11 @@ function SummaryScreen({
 
                 <div>
                   <p className="font-bold text-slate-900">
-                    Ready for clinician review
+                    Doctor Review
                   </p>
 
                   <p className="text-xs text-slate-500">
-                    Final clinical decisions remain with the doctor.
+                    Clinical verification checklist
                   </p>
                 </div>
               </div>
@@ -636,12 +1247,24 @@ function SummaryScreen({
                 />
 
                 <ReviewPoint
-                  complete={true}
-                  text="Structured history generated"
+                  complete={clinical.chiefComplaint !== "Not clearly documented"}
+                  text="Chief complaint identified"
                 />
 
                 <ReviewPoint
-                  complete={redFlags.length > 0}
+                  complete={answers.length >= 3}
+                  text="Clinical history documented"
+                />
+
+                <ReviewPoint
+                  complete={
+                    clinical.associatedSymptoms.length > 0
+                  }
+                  text="Associated symptoms reviewed"
+                />
+
+                <ReviewPoint
+                  complete={redFlags.length === 0}
                   warning={redFlags.length > 0}
                   text={
                     redFlags.length > 0
@@ -652,43 +1275,47 @@ function SummaryScreen({
               </div>
             </section>
 
-            {/* Interview transcript */}
+            {/* Interview record */}
             <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
-              <div className="mb-5 flex items-center gap-3">
-                <FileText
-                  size={20}
-                  className="text-slate-600"
-                />
+              <div className="mb-5 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <FileText
+                    size={20}
+                    className="text-slate-600"
+                  />
 
-                <div>
-                  <p className="font-bold text-slate-900">
-                    Interview record
-                  </p>
+                  <div>
+                    <p className="font-bold text-slate-900">
+                      Interview Record
+                    </p>
 
-                  <p className="text-xs text-slate-500">
-                    {answers.length} recorded responses
-                  </p>
+                    <p className="text-xs text-slate-500">
+                      {answers.length} recorded responses
+                    </p>
+                  </div>
                 </div>
               </div>
 
-              <div className="max-h-80 space-y-3 overflow-y-auto pr-1">
+              <div className="max-h-[480px] space-y-3 overflow-y-auto pr-1">
                 {answers.length > 0 ? (
                   answers.map((item, index) => (
                     <div
                       key={`${item.question}-${index}`}
-                      className="rounded-xl bg-slate-50 p-3"
+                      className="rounded-2xl border border-slate-100 bg-slate-50 p-4"
                     >
-                      <p className="text-[11px] font-bold uppercase tracking-wider text-slate-400">
-                        Q{index + 1}
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                        Question {index + 1}
                       </p>
 
-                      <p className="mt-1 text-xs font-semibold leading-5 text-slate-700">
+                      <p className="mt-1 text-xs font-bold leading-5 text-slate-700">
                         {item.question}
                       </p>
 
-                      <p className="mt-2 text-xs leading-5 text-slate-500">
-                        {item.answer}
-                      </p>
+                      <div className="mt-3 rounded-xl bg-white p-3">
+                        <p className="text-xs leading-5 text-slate-600">
+                          {item.answer}
+                        </p>
+                      </div>
                     </div>
                   ))
                 ) : (
@@ -708,17 +1335,20 @@ function SummaryScreen({
                 />
 
                 <p className="text-[11px] leading-5 text-slate-500">
-                  AI-generated content is provided as a clinical
-                  documentation aid only. It must be reviewed by a
-                  qualified healthcare professional before use in
-                  patient care.
+                  AI-generated content is provided as a
+                  clinical documentation aid only. It must
+                  be reviewed by a qualified healthcare
+                  professional before use in patient care.
                 </p>
               </div>
             </div>
           </aside>
         </div>
 
-        {/* Bottom actions */}
+        {/* ===================================================
+            FOOTER ACTIONS
+        =================================================== */}
+
         <div className="mt-8 flex flex-col-reverse gap-3 border-t border-slate-200 pt-6 sm:flex-row sm:items-center sm:justify-between">
           <button
             type="button"
@@ -734,7 +1364,8 @@ function SummaryScreen({
             className="flex items-center justify-center gap-2 rounded-2xl bg-blue-600 px-7 py-4 text-sm font-bold text-white shadow-lg shadow-blue-600/20 transition hover:bg-blue-700"
           >
             <ClipboardCheck size={19} />
-            Continue to doctor review
+            Continue to Doctor Review
+            <ChevronRight size={18} />
           </button>
         </div>
       </main>
@@ -742,52 +1373,37 @@ function SummaryScreen({
   );
 }
 
-function InfoCard({
+/* =========================================================
+   VITAL ROW
+========================================================= */
+
+function VitalRow({
+  icon: Icon,
   label,
   value,
-  danger = false,
 }) {
   return (
-    <div
-      className={`rounded-xl p-3 ${
-        danger
-          ? "bg-amber-50"
-          : "bg-slate-50"
-      }`}
-    >
-      <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-        {label}
-      </p>
+    <div className="flex items-center justify-between rounded-2xl bg-slate-50 p-3">
+      <div className="flex items-center gap-3">
+        <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-white text-slate-500 shadow-sm">
+          <Icon size={16} />
+        </div>
 
-      <p
-        className={`mt-1 text-sm font-bold ${
-          danger
-            ? "text-amber-700"
-            : "text-slate-800"
-        }`}
-      >
-        {value}
+        <p className="text-xs font-semibold text-slate-600">
+          {label}
+        </p>
+      </div>
+
+      <p className="text-sm font-bold text-slate-900">
+        {value || "—"}
       </p>
     </div>
   );
 }
 
-function MiniClinicalCard({
-  label,
-  value,
-}) {
-  return (
-    <div className="rounded-xl border border-blue-100 bg-white p-3">
-      <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-        {label}
-      </p>
-
-      <p className="mt-1 text-sm font-semibold leading-5 text-slate-800">
-        {value}
-      </p>
-    </div>
-  );
-}
+/* =========================================================
+   REVIEW POINT
+========================================================= */
 
 function ReviewPoint({
   complete,
@@ -797,7 +1413,7 @@ function ReviewPoint({
   return (
     <div className="flex items-center gap-3 rounded-xl bg-slate-50 p-3">
       <div
-        className={`flex h-7 w-7 items-center justify-center rounded-full ${
+        className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full ${
           warning
             ? "bg-amber-100 text-amber-600"
             : complete

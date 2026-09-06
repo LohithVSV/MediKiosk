@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 
 import WelcomeScreen from "./screens/WelcomeScreen";
 import ConsultationScreen from "./screens/ConsultationScreen";
@@ -81,11 +81,22 @@ function App() {
     }));
   };
 
+  // Language selection from WelcomeScreen
+  const handleLanguageSelect = (language) => {
+    setPatientData((previous) => ({
+      ...previous,
+      language,
+    }));
+
+    setScreen("consultation");
+  };
+
   const startConsultation = (setup = {}) => {
     setPatientData((previous) => ({
       ...previous,
 
       language: setup.language || previous.language,
+
       consultationType:
         setup.consultationType || previous.consultationType,
 
@@ -159,7 +170,7 @@ function App() {
       {screen === "welcome" && (
         <WelcomeScreen
           patientData={patientData}
-          onStart={() => setScreen("consultation")}
+          onStart={handleLanguageSelect}
         />
       )}
 

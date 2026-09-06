@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from "react";
 import {
   ArrowRight,
   Brain,
@@ -10,21 +10,274 @@ import {
   Sparkles,
   Stethoscope,
   UserRound,
-} from 'lucide-react';
+} from "lucide-react";
+
+const LANGUAGES = [
+  {
+    name: "English",
+    code: "en-IN",
+    greeting:
+      "Hello. Welcome to MediKiosk. I will ask you a few simple questions about your health before your consultation. Please choose your preferred language after listening to all the options.",
+  },
+  {
+    name: "Hindi",
+    code: "hi-IN",
+    greeting:
+      "नमस्ते। MediKiosk में आपका स्वागत है। आपकी consultation से पहले मैं आपके स्वास्थ्य के बारे में कुछ आसान सवाल पूछूंगा। सभी भाषाओं को सुनने के बाद अपनी पसंदीदा भाषा चुनें।",
+  },
+  {
+    name: "Telugu",
+    code: "te-IN",
+    greeting:
+      "నమస్కారం. MediKiosk కి స్వాగతం. మీ consultation కి ముందు మీ ఆరోగ్యం గురించి కొన్ని సులభమైన ప్రశ్నలు అడుగుతాను. అన్ని భాషలను విన్న తర్వాత మీకు నచ్చిన భాషను ఎంచుకోండి.",
+  },
+];
 
 export default function WelcomeScreen({
   onStart,
   startInterview,
   patientData = {},
 }) {
-  const handleStart = () => {
-    if (typeof onStart === 'function') {
-      onStart();
+  const [activeLanguage, setActiveLanguage] = useState(0);
+  const [selectedLanguage, setSelectedLanguage] = useState(
+    patientData?.language || ""
+  );
+  const [isCycling, setIsCycling] = useState(true);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+
+  const cycleRef = useRef(true);
+  const mountedRef = useRef(true);
+  const startedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    cycleRef.current = true;
+
+    const startTimer = setTimeout(() => {
+      if (!mountedRef.current || !cycleRef.current || startedRef.current) {
+        return;
+      }
+
+      startedRef.current = true;
+
+      playLanguage(0);
+    }, 500);
+
+    return () => {
+      mountedRef.current = false;
+      cycleRef.current = false;
+      clearTimeout(startTimer);
+
+      if (window.speechSynthesis) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
+  const playLanguage = (index) => {
+    if (!mountedRef.current || !cycleRef.current) {
       return;
     }
 
-    if (typeof startInterview === 'function') {
-      startInterview();
+    const language = LANGUAGES[index];
+
+    if (!language) {
+      setIsSpeaking(false);
+      setIsCycling(false);
+      return;
+    }
+
+    setActiveLanguage(index);
+    setIsSpeaking(false);
+
+    const speak = () => {
+      if (!mountedRef.current || !cycleRef.current) {
+        return;
+      }
+
+      if (!window.speechSynthesis) {
+        setIsSpeaking(false);
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(language.greeting);
+
+      utterance.lang = language.code;
+      utterance.rate = 0.9;
+      utterance.pitch = 1;
+
+      const voices = window.speechSynthesis.getVoices();
+
+      const matchingVoice =
+        voices.find(
+          (voice) =>
+            voice.lang?.toLowerCase() === language.code.toLowerCase()
+        ) ||
+        voices.find((voice) =>
+          voice.lang?.toLowerCase().startsWith(language.code.slice(0, 2))
+        );
+
+      if (matchingVoice) {
+        utterance.voice = matchingVoice;
+      }
+
+      utterance.onstart = () => {
+        if (!mountedRef.current || !cycleRef.current) {
+          return;
+        }
+
+        setIsSpeaking(true);
+      };
+
+      utterance.onend = () => {
+        if (!mountedRef.current || !cycleRef.current) {
+          return;
+        }
+
+        // Green light goes OFF as soon as this language finishes.
+        setIsSpeaking(false);
+
+        if (index < LANGUAGES.length - 1) {
+          setTimeout(() => {
+            if (!mountedRef.current || !cycleRef.current) {
+              return;
+            }
+
+            playLanguage(index + 1);
+          }, 800);
+        } else {
+          setTimeout(() => {
+            if (!mountedRef.current || !cycleRef.current) {
+              return;
+            }
+
+            setIsCycling(false);
+            setIsSpeaking(false);
+          }, 800);
+        }
+      };
+
+      utterance.onerror = (event) => {
+        if (!mountedRef.current || !cycleRef.current) {
+          return;
+        }
+
+        // Ignore cancellation/interruption errors.
+        if (
+          event?.error === "canceled" ||
+          event?.error === "interrupted"
+        ) {
+          return;
+        }
+
+        setIsSpeaking(false);
+
+        // Continue the language cycle even if the browser voice engine
+        // reports an error.
+        if (index < LANGUAGES.length - 1) {
+          setTimeout(() => {
+            if (!mountedRef.current || !cycleRef.current) {
+              return;
+            }
+
+            playLanguage(index + 1);
+          }, 800);
+        } else {
+          setIsCycling(false);
+        }
+      };
+
+      window.speechSynthesis.speak(utterance);
+    };
+
+    // Give the browser time to finish loading available voices.
+    if (window.speechSynthesis.getVoices().length === 0) {
+      const handleVoicesChanged = () => {
+        window.speechSynthesis.removeEventListener(
+          "voiceschanged",
+          handleVoicesChanged
+        );
+
+        speak();
+      };
+
+      window.speechSynthesis.addEventListener(
+        "voiceschanged",
+        handleVoicesChanged
+      );
+
+      setTimeout(() => {
+        window.speechSynthesis.removeEventListener(
+          "voiceschanged",
+          handleVoicesChanged
+        );
+
+        if (mountedRef.current && cycleRef.current) {
+          speak();
+        }
+      }, 700);
+    } else {
+      speak();
+    }
+  };
+
+  const handleLanguageSelect = (languageName) => {
+    cycleRef.current = false;
+    setIsCycling(false);
+    setIsSpeaking(false);
+
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+
+    setSelectedLanguage(languageName);
+
+    const selected = LANGUAGES.find(
+      (language) => language.name === languageName
+    );
+
+    if (selected) {
+      const utterance = new SpeechSynthesisUtterance(selected.greeting);
+
+      utterance.lang = selected.code;
+      utterance.rate = 0.9;
+      utterance.pitch = 1;
+
+      const voices = window.speechSynthesis.getVoices();
+
+      const matchingVoice =
+        voices.find(
+          (voice) =>
+            voice.lang?.toLowerCase() === selected.code.toLowerCase()
+        ) ||
+        voices.find((voice) =>
+          voice.lang?.toLowerCase().startsWith(selected.code.slice(0, 2))
+        );
+
+      if (matchingVoice) {
+        utterance.voice = matchingVoice;
+      }
+
+      window.speechSynthesis.speak(utterance);
+    }
+  };
+
+  const handleStart = () => {
+    cycleRef.current = false;
+    setIsCycling(false);
+    setIsSpeaking(false);
+
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+
+    if (typeof onStart === "function") {
+      onStart(selectedLanguage);
+      return;
+    }
+
+    if (typeof startInterview === "function") {
+      startInterview(selectedLanguage);
     }
   };
 
@@ -42,6 +295,7 @@ export default function WelcomeScreen({
               <h1 className="text-lg font-bold tracking-tight text-slate-900">
                 MediKiosk
               </h1>
+
               <p className="text-[11px] font-medium text-slate-500">
                 AI-assisted clinical history
               </p>
@@ -50,6 +304,7 @@ export default function WelcomeScreen({
 
           <div className="hidden items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 sm:flex">
             <ShieldCheck size={15} className="text-emerald-600" />
+
             <span className="text-xs font-semibold text-emerald-700">
               Private &amp; secure
             </span>
@@ -60,10 +315,11 @@ export default function WelcomeScreen({
       {/* Main */}
       <main className="mx-auto flex min-h-[calc(100vh-76px)] max-w-7xl items-center px-5 py-10 sm:px-8 lg:py-14">
         <div className="grid w-full items-center gap-12 lg:grid-cols-[1.05fr_0.95fr] lg:gap-16">
-          {/* Left — introduction */}
+          {/* Left */}
           <section className="max-w-2xl">
             <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-sky-200 bg-sky-50 px-3.5 py-2">
               <Sparkles size={15} className="text-sky-600" />
+
               <span className="text-xs font-bold uppercase tracking-wide text-sky-700">
                 AI clinical assistant
               </span>
@@ -103,28 +359,124 @@ export default function WelcomeScreen({
               />
             </div>
 
-            {/* Start button */}
+            {/* Language selection */}
             <div className="mt-9">
-              <button
-                type="button"
-                onClick={handleStart}
-                className="group inline-flex w-full items-center justify-center gap-3 rounded-2xl bg-slate-900 px-7 py-4 text-base font-bold text-white shadow-lg shadow-slate-900/10 transition duration-200 hover:-translate-y-0.5 hover:bg-slate-800 hover:shadow-xl sm:w-auto"
-              >
-                <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-white/10">
-                  <Mic size={17} />
-                </span>
+              <div className="mb-4">
+                <p className="text-sm font-bold text-slate-800">
+                  Choose your language
+                </p>
 
-                Start consultation
+                <p className="mt-1 text-xs text-slate-500">
+                  Listen to each option, then select the language you prefer.
+                </p>
+              </div>
 
-                <ArrowRight
-                  size={18}
-                  className="transition-transform duration-200 group-hover:translate-x-1"
-                />
-              </button>
+              <div className="grid gap-3 sm:grid-cols-3">
+                {LANGUAGES.map((language, index) => {
+                  const isActive =
+                    isCycling &&
+                    isSpeaking &&
+                    activeLanguage === index;
 
-              <p className="mt-3 text-xs text-slate-400">
-                You can also type your answers if you prefer.
-              </p>
+                  const isSelected =
+                    !isCycling && selectedLanguage === language.name;
+
+                  return (
+                    <button
+                      key={language.name}
+                      type="button"
+                      onClick={() =>
+                        handleLanguageSelect(language.name)
+                      }
+                      className={[
+                        "relative overflow-hidden rounded-2xl border p-4 text-left transition-all duration-300",
+                        isActive
+                          ? "border-emerald-400 bg-emerald-50 shadow-lg shadow-emerald-200/60"
+                          : isSelected
+                            ? "border-emerald-400 bg-emerald-50 shadow-md shadow-emerald-200/40"
+                            : "border-slate-200 bg-white hover:-translate-y-0.5 hover:border-sky-300 hover:shadow-md",
+                      ].join(" ")}
+                    >
+                      {isActive && (
+                        <div className="absolute right-3 top-3 flex items-center gap-1.5">
+                          <span className="relative flex h-3 w-3">
+                            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+                            <span className="relative inline-flex h-3 w-3 rounded-full bg-emerald-500" />
+                          </span>
+
+                          <span className="text-[10px] font-bold uppercase tracking-wide text-emerald-700">
+                            Speaking
+                          </span>
+                        </div>
+                      )}
+
+                      <div
+                        className={[
+                          "mb-3 flex h-10 w-10 items-center justify-center rounded-xl transition-colors",
+                          isActive || isSelected
+                            ? "bg-emerald-100 text-emerald-600"
+                            : "bg-sky-50 text-sky-600",
+                        ].join(" ")}
+                      >
+                        <Languages size={19} />
+                      </div>
+
+                      <p className="text-sm font-bold text-slate-900">
+                        {language.name}
+                      </p>
+
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {language.name === "English"
+                          ? "English"
+                          : language.name === "Hindi"
+                            ? "हिन्दी"
+                            : "తెలుగు"}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Start button */}
+              <div className="mt-6">
+                <button
+                  type="button"
+                  onClick={handleStart}
+                  disabled={!selectedLanguage}
+                  className={[
+                    "group inline-flex w-full items-center justify-center gap-3 rounded-2xl px-7 py-4 text-base font-bold shadow-lg transition duration-200 sm:w-auto",
+                    selectedLanguage
+                      ? "bg-emerald-600 text-white shadow-emerald-600/20 hover:-translate-y-0.5 hover:bg-emerald-700 hover:shadow-xl"
+                      : "cursor-not-allowed bg-slate-200 text-slate-400 shadow-none",
+                  ].join(" ")}
+                >
+                  <span
+                    className={[
+                      "flex h-8 w-8 items-center justify-center rounded-lg",
+                      selectedLanguage
+                        ? "bg-white/15"
+                        : "bg-slate-300",
+                    ].join(" ")}
+                  >
+                    <Mic size={17} />
+                  </span>
+
+                  Start consultation
+
+                  <ArrowRight
+                    size={18}
+                    className={
+                      selectedLanguage
+                        ? "transition-transform duration-200 group-hover:translate-x-1"
+                        : ""
+                    }
+                  />
+                </button>
+
+                <p className="mt-3 text-xs text-slate-400">
+                  You can also type your answers if you prefer.
+                </p>
+              </div>
             </div>
           </section>
 
@@ -145,6 +497,7 @@ export default function WelcomeScreen({
                         <p className="text-sm font-bold text-slate-900">
                           New consultation
                         </p>
+
                         <p className="text-xs text-slate-500">
                           MediKiosk interview
                         </p>
@@ -211,9 +564,21 @@ export default function WelcomeScreen({
                 <div className="border-t border-slate-100 bg-white px-6 py-4">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <div className="h-2 w-2 animate-pulse rounded-full bg-emerald-500" />
+                      <div
+                        className={[
+                          "h-2 w-2 rounded-full transition-all duration-300",
+                          isSpeaking
+                            ? "animate-pulse bg-emerald-500"
+                            : "bg-slate-300",
+                        ].join(" ")}
+                      />
+
                       <span className="text-xs font-semibold text-slate-500">
-                        Ready to listen
+                        {isSpeaking
+                          ? "MediKiosk is speaking"
+                          : selectedLanguage
+                            ? "Language selected"
+                            : "Choose your language"}
                       </span>
                     </div>
 
@@ -266,8 +631,13 @@ function TrustPoint({ icon, title, text }) {
         {icon}
       </div>
 
-      <p className="text-sm font-bold text-slate-800">{title}</p>
-      <p className="mt-0.5 text-xs leading-5 text-slate-500">{text}</p>
+      <p className="text-sm font-bold text-slate-800">
+        {title}
+      </p>
+
+      <p className="mt-0.5 text-xs leading-5 text-slate-500">
+        {text}
+      </p>
     </div>
   );
 }
@@ -280,10 +650,14 @@ function MiniFeature({ icon, title, text }) {
           {icon}
         </div>
 
-        <p className="text-xs font-bold text-slate-800">{title}</p>
+        <p className="text-xs font-bold text-slate-800">
+          {title}
+        </p>
       </div>
 
-      <p className="mt-2 text-[11px] leading-5 text-slate-500">{text}</p>
+      <p className="mt-2 text-[11px] leading-5 text-slate-500">
+        {text}
+      </p>
     </div>
   );
 }
