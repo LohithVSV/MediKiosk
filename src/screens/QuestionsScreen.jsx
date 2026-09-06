@@ -237,24 +237,26 @@ const RED_FLAG_PATTERNS = [
   which kinds of information have already been established.
 */
 const MEMORY_TOPIC_KEYWORDS = {
-  complaint: [
-    "problem",
-    "symptom",
-    "complaint",
-    "pain",
-    "ache",
-    "issue",
-    "परेशानी",
-    "समस्या",
-    "दर्द",
-    "నొప్పి",
-    "సమస్య",
-    "ఇబ్బంది",
-    "வலி",
-    "பிரச்சினை",
+  chiefComplaint: [
+    "what brings you",
+    "what problem",
+    "what is the problem",
+    "what symptom",
+    "why are you here",
+    "reason for your visit",
+    "main complaint",
+    "main problem",
+    "आप किस समस्या",
+    "क्या परेशानी है",
+    "मुख्य समस्या",
+    "మీరు ఏ సమస్యతో",
+    "మీ ప్రధాన సమస్య",
+    "ఇబ్బంది ఏమిటి",
+    "என்ன பிரச்சினை",
+    "முதன்மை பிரச்சினை",
   ],
 
-  duration: [
+  onset: [
     "how long",
     "since when",
     "days",
@@ -394,7 +396,7 @@ const MEMORY_TOPIC_KEYWORDS = {
     "காய்ச்சல்",
   ],
 
-  history: [
+  relevantHistory: [
     "happened before",
     "previously",
     "past history",
